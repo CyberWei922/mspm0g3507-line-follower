@@ -4,7 +4,10 @@
  * Safe behavior:
  *   - power-on/debugger resets command stop and wait
  *   - only a physical RST/NRST press arms the two-second start sequence
- *   - I2C failure, sustained line loss, or sustained all-black input stops
+ *   - I2C failure, sustained line loss, turn timeout, or sustained
+ *     all-black input stops
+ *   - confirmed 90-degree corners use forward compensation, pivot, and
+ *     center-sensor reacquisition before returning to PID
  *
  * Wiring:
  *   PA12 SCL, PA13 SDA (Yahboom motor driver, software I2C)
@@ -38,6 +41,10 @@
 #define WIDE_MARK_SPEED     ((int16_t) 90)
 #define MAX_WHEEL_SPEED     ((int16_t) 320)
 #define MAX_PID_CORRECTION  ((int16_t) 160)
+#define CORNER_APPROACH_SPEED ((int16_t) 110)
+#define CORNER_PIVOT_SPEED    ((int16_t) 135)
+#define CORNER_SETTLE_SPEED   ((int16_t) 105)
+#define LOST_PIVOT_SPEED      ((int16_t) 90)
 
 /* Fixed-point PID gains: Kp=0.45, Ki=0, Kd=0.70 initially. */
 #define PID_KP_NUM          (45L)
@@ -51,6 +58,12 @@
 #define LOST_LINE_LIMIT_CYCLES (40U)
 #define WIDE_MARK_LIMIT_CYCLES (25U)
 #define STARTUP_SAMPLE_COUNT   (32U)
+#define CORNER_CONFIRM_CYCLES       (2U)
+#define CORNER_APPROACH_CYCLES      (8U)
+#define CORNER_REACQUIRE_CYCLES     (2U)
+#define CORNER_SETTLE_CYCLES        (6U)
+#define CORNER_TURN_TIMEOUT_CYCLES  (60U)
+#define LOST_PIVOT_AFTER_CYCLES     (5U)
 
 #define DELAY_5_MS         ((CPUCLK_FREQ / 1000U) * 5U)
 #define DELAY_20_MS        ((CPUCLK_FREQ / 1000U) * 20U)
@@ -59,7 +72,7 @@
 #define DELAY_100_MS       (CPUCLK_FREQ / 10U)
 #define DELAY_250_MS       (CPUCLK_FREQ / 4U)
 #define DELAY_600_MS       ((CPUCLK_FREQ / 1000U) * 600U)
-#define CONTROL_LOOP_DELAY ((CPUCLK_FREQ / 1000U) * 17U)
+#define CONTROL_LOOP_DELAY ((CPUCLK_FREQ / 1000U) * 15U)
 #define GRAY8_SETTLE_CYCLES ((CPUCLK_FREQ / 1000000U) * 100U)
 
 /* About 50 kHz with two delays in each software-I2C clock period. */
@@ -70,15 +83,39 @@ typedef enum {
     FOLLOW_STATE_WAITING_FOR_RST = 0,
     FOLLOW_STATE_ARMING,
     FOLLOW_STATE_RUNNING,
+    FOLLOW_STATE_CORNER_APPROACH,
+    FOLLOW_STATE_CORNER_PIVOT,
+    FOLLOW_STATE_CORNER_SETTLE,
     FOLLOW_STATE_I2C_FAULT,
     FOLLOW_STATE_START_LINE_FAULT,
     FOLLOW_STATE_LINE_LOST,
-    FOLLOW_STATE_WIDE_MARK_FAULT
+    FOLLOW_STATE_WIDE_MARK_FAULT,
+    FOLLOW_STATE_TURN_TIMEOUT
 } FollowState;
+
+typedef enum {
+    CORNER_NONE = 0,
+    CORNER_LEFT = -1,
+    CORNER_RIGHT = 1
+} CornerDirection;
+
+#if GRAY8_CHANNEL0_IS_LEFT
+#define LEFT_HALF_MASK   (0x0FU)
+#define RIGHT_HALF_MASK  (0xF0U)
+#define LEFT_OUTER_MASK  (0x03U)
+#define RIGHT_OUTER_MASK (0xC0U)
+#else
+#define LEFT_HALF_MASK   (0xF0U)
+#define RIGHT_HALF_MASK  (0x0FU)
+#define LEFT_OUTER_MASK  (0xC0U)
+#define RIGHT_OUTER_MASK (0x03U)
+#endif
+#define CENTER_SENSOR_MASK (0x18U)
 
 volatile DL_SYSCTL_RESET_CAUSE gResetCause;
 volatile bool gExternalResetDetected;
 volatile FollowState gFollowState;
+volatile CornerDirection gCornerDirection;
 volatile uint8_t gGrayRaw;
 volatile uint8_t gBlackMask;
 volatile uint8_t gActiveSensorCount;
@@ -91,11 +128,17 @@ volatile int16_t gRightCommand;
 volatile uint32_t gControlCycles;
 volatile uint16_t gLostLineCycles;
 volatile uint16_t gWideMarkCycles;
+volatile uint16_t gCornerPhaseCycles;
+volatile uint8_t gCornerConfirmCycles;
+volatile uint8_t gCornerReacquireCycles;
 volatile uint32_t gI2cErrorCount;
 
 static int16_t sPreviousError;
 static int16_t sLastValidError;
+static int16_t sFilteredDerivative;
 static int32_t sIntegral;
+static CornerDirection sCornerCandidate;
+static bool sCornerOldLineCleared;
 
 static const int16_t sLineWeights[8] = {
     -350, -250, -150, -50, 50, 150, 250, 350
@@ -379,6 +422,19 @@ static uint8_t gray8ReadRaw(void)
     return raw;
 }
 
+/*
+ * Three complete scans with a per-channel majority vote reject a single
+ * reflection/noise spike without introducing a long moving-average delay.
+ */
+static uint8_t gray8ReadMajorityRaw(void)
+{
+    uint8_t first = gray8ReadRaw();
+    uint8_t second = gray8ReadRaw();
+    uint8_t third = gray8ReadRaw();
+
+    return (uint8_t) ((first & second) | (first & third) | (second & third));
+}
+
 static uint8_t gray8CaptureStableRaw(void)
 {
     uint8_t channel;
@@ -453,12 +509,35 @@ static int16_t clampPidCorrection(int32_t correction)
     return (int16_t) correction;
 }
 
+static void pidReset(int16_t error)
+{
+    sPreviousError = error;
+    sFilteredDerivative = 0;
+    sIntegral = 0L;
+}
+
 static int16_t pidUpdate(int16_t error)
 {
-    int32_t derivative = (int32_t) error - sPreviousError;
+    int32_t rawDerivative = (int32_t) error - sPreviousError;
+    int32_t magnitude = error;
     int32_t output;
 
-    sIntegral += error;
+    /*
+     * Filter derivative noise and only accumulate integral near center.
+     * Ki remains zero initially, but this avoids windup if it is tuned later.
+     */
+    sFilteredDerivative =
+        (int16_t) (((3L * sFilteredDerivative) + rawDerivative) / 4L);
+
+    if (magnitude < 0L) {
+        magnitude = -magnitude;
+    }
+    if (magnitude <= 200L) {
+        sIntegral += error;
+    } else {
+        sIntegral = (3L * sIntegral) / 4L;
+    }
+
     if (sIntegral > PID_INTEGRAL_LIMIT) {
         sIntegral = PID_INTEGRAL_LIMIT;
     } else if (sIntegral < -PID_INTEGRAL_LIMIT) {
@@ -467,7 +546,7 @@ static int16_t pidUpdate(int16_t error)
 
     output = ((PID_KP_NUM * error) / PID_KP_DEN) +
              ((PID_KI_NUM * sIntegral) / PID_KI_DEN) +
-             ((PID_KD_NUM * derivative) / PID_KD_DEN);
+             ((PID_KD_NUM * sFilteredDerivative) / PID_KD_DEN);
     sPreviousError = error;
     return clampPidCorrection(output);
 }
@@ -515,14 +594,151 @@ static void stopAndLatchFault(FollowState fault, uint8_t beepCount, bool longBee
     }
 }
 
+static CornerDirection detectCornerCandidate(uint8_t blackMask)
+{
+    uint8_t leftCount = countSetBits((uint8_t) (blackMask & LEFT_HALF_MASK));
+    uint8_t rightCount =
+        countSetBits((uint8_t) (blackMask & RIGHT_HALF_MASK));
+
+    if ((leftCount >= 3U) && (rightCount <= 1U) &&
+        ((blackMask & LEFT_OUTER_MASK) != 0U)) {
+        return CORNER_LEFT;
+    }
+    if ((rightCount >= 3U) && (leftCount <= 1U) &&
+        ((blackMask & RIGHT_OUTER_MASK) != 0U)) {
+        return CORNER_RIGHT;
+    }
+    return CORNER_NONE;
+}
+
+static void commandChassisOrFault(int16_t left, int16_t right)
+{
+    gLeftCommand = left;
+    gRightCommand = right;
+
+    if (!setChassisSpeed(left, right)) {
+        gI2cErrorCount++;
+        stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
+    }
+}
+
+static void beginCorner(CornerDirection direction)
+{
+    gCornerDirection = direction;
+    gFollowState = FOLLOW_STATE_CORNER_APPROACH;
+    gCornerPhaseCycles = 0U;
+    gCornerReacquireCycles = 0U;
+    sCornerOldLineCleared = false;
+    sCornerCandidate = CORNER_NONE;
+    gCornerConfirmCycles = 0U;
+    pidReset(sLastValidError);
+    greenLed(false);
+    blueLed(true);
+}
+
+static void cornerControlStep(void)
+{
+    bool centerDetected =
+        ((gBlackMask & CENTER_SENSOR_MASK) != 0U) &&
+        (gActiveSensorCount >= 1U) && (gActiveSensorCount <= 4U);
+
+    if (gFollowState == FOLLOW_STATE_CORNER_APPROACH) {
+        commandChassisOrFault(CORNER_APPROACH_SPEED, CORNER_APPROACH_SPEED);
+        gCornerPhaseCycles++;
+
+        if (gCornerPhaseCycles >= CORNER_APPROACH_CYCLES) {
+            gFollowState = FOLLOW_STATE_CORNER_PIVOT;
+            gCornerPhaseCycles = 0U;
+            gCornerReacquireCycles = 0U;
+            sCornerOldLineCleared = false;
+        }
+        return;
+    }
+
+    if (gFollowState == FOLLOW_STATE_CORNER_PIVOT) {
+        if (gCornerDirection == CORNER_LEFT) {
+            commandChassisOrFault(
+                (int16_t) -CORNER_PIVOT_SPEED, CORNER_PIVOT_SPEED);
+        } else {
+            commandChassisOrFault(
+                CORNER_PIVOT_SPEED, (int16_t) -CORNER_PIVOT_SPEED);
+        }
+
+        gCornerPhaseCycles++;
+        if (!centerDetected) {
+            sCornerOldLineCleared = true;
+            gCornerReacquireCycles = 0U;
+        } else if (sCornerOldLineCleared) {
+            gCornerReacquireCycles++;
+            if (gCornerReacquireCycles >= CORNER_REACQUIRE_CYCLES) {
+                gFollowState = FOLLOW_STATE_CORNER_SETTLE;
+                gCornerPhaseCycles = 0U;
+                gLinePosition =
+                    blackMaskToPosition(gBlackMask, gActiveSensorCount);
+                gFilteredError = gLinePosition;
+                sLastValidError = gLinePosition;
+                pidReset(gLinePosition);
+            }
+        }
+
+        if (gCornerPhaseCycles > CORNER_TURN_TIMEOUT_CYCLES) {
+            stopAndLatchFault(FOLLOW_STATE_TURN_TIMEOUT, 5U, false);
+        }
+        return;
+    }
+
+    /* Drive slowly across the corner before returning control to PID. */
+    commandChassisOrFault(CORNER_SETTLE_SPEED, CORNER_SETTLE_SPEED);
+    gCornerPhaseCycles++;
+    if (gCornerPhaseCycles >= CORNER_SETTLE_CYCLES) {
+        gFollowState = FOLLOW_STATE_RUNNING;
+        gCornerDirection = CORNER_NONE;
+        gCornerPhaseCycles = 0U;
+        pidReset(sLastValidError);
+        greenLed(true);
+        blueLed(false);
+    }
+}
+
 static void lineFollowerStep(void)
 {
+    CornerDirection cornerCandidate;
     int16_t controlError;
     int16_t baseSpeed;
 
-    gGrayRaw = gray8ReadRaw();
+    gGrayRaw = gray8ReadMajorityRaw();
     gBlackMask = rawToBlackMask(gGrayRaw);
     gActiveSensorCount = countSetBits(gBlackMask);
+
+    if ((gFollowState == FOLLOW_STATE_CORNER_APPROACH) ||
+        (gFollowState == FOLLOW_STATE_CORNER_PIVOT) ||
+        (gFollowState == FOLLOW_STATE_CORNER_SETTLE)) {
+        cornerControlStep();
+        gControlCycles++;
+        return;
+    }
+
+    cornerCandidate = detectCornerCandidate(gBlackMask);
+    if (cornerCandidate != CORNER_NONE) {
+        if (cornerCandidate == sCornerCandidate) {
+            if (gCornerConfirmCycles < CORNER_CONFIRM_CYCLES) {
+                gCornerConfirmCycles++;
+            }
+        } else {
+            sCornerCandidate = cornerCandidate;
+            gCornerConfirmCycles = 1U;
+        }
+
+        if (gCornerConfirmCycles >= CORNER_CONFIRM_CYCLES) {
+            beginCorner(cornerCandidate);
+            cornerControlStep();
+            gControlCycles++;
+            return;
+        }
+    } else {
+        sCornerCandidate = CORNER_NONE;
+        gCornerConfirmCycles = 0U;
+    }
 
     if (gActiveSensorCount == 0U) {
         gLostLineCycles++;
@@ -531,6 +747,18 @@ static void lineFollowerStep(void)
 
         if (gLostLineCycles > LOST_LINE_LIMIT_CYCLES) {
             stopAndLatchFault(FOLLOW_STATE_LINE_LOST, 2U, true);
+        }
+
+        if (gLostLineCycles >= LOST_PIVOT_AFTER_CYCLES) {
+            if (sLastValidError <= 0) {
+                commandChassisOrFault(
+                    (int16_t) -LOST_PIVOT_SPEED, LOST_PIVOT_SPEED);
+            } else {
+                commandChassisOrFault(
+                    LOST_PIVOT_SPEED, (int16_t) -LOST_PIVOT_SPEED);
+            }
+            gControlCycles++;
+            return;
         }
 
         controlError = sLastValidError;
@@ -566,10 +794,7 @@ static void lineFollowerStep(void)
     gRightCommand =
         clampWheelCommand((int32_t) baseSpeed - gPidCorrection);
 
-    if (!setChassisSpeed(gLeftCommand, gRightCommand)) {
-        gI2cErrorCount++;
-        stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
-    }
+    commandChassisOrFault(gLeftCommand, gRightCommand);
 
     gControlCycles++;
 }
@@ -637,9 +862,13 @@ int main(void)
     gActiveSensorCount = initialBlackCount;
     gLinePosition = blackMaskToPosition(initialBlackMask, initialBlackCount);
     gFilteredError = gLinePosition;
-    sPreviousError = gLinePosition;
     sLastValidError = gLinePosition;
-    sIntegral = 0L;
+    sCornerCandidate = CORNER_NONE;
+    gCornerDirection = CORNER_NONE;
+    gCornerConfirmCycles = 0U;
+    gCornerPhaseCycles = 0U;
+    gCornerReacquireCycles = 0U;
+    pidReset(gLinePosition);
 
     gFollowState = FOLLOW_STATE_RUNNING;
     greenLed(true);

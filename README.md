@@ -30,6 +30,30 @@ paths through the core board or motor driver.
 5. Two short beeps mean the line was recognized and following is starting.
 6. The car follows using differential steering. The initial base speed is 190.
 
+## PID and right-angle behavior
+
+Normal tracking keeps the already tested Kp/Kd values, with two robustness
+changes:
+
+- each of the eight digital sensors uses a three-scan majority vote;
+- the derivative term is low-pass filtered, so a single sensor-edge spike does
+  not create a large steering kick.
+
+A confirmed right-angle pattern enters this non-blocking state sequence:
+
+1. The same left/right corner must be detected for two consecutive loops.
+2. Both sides drive at speed 110 for eight loops (about 160 ms). This moves the
+   wheel rotation center toward the corner instead of pivoting as soon as the
+   front sensor bar sees it.
+3. The chassis pivots in place at speed 135 toward the detected side.
+4. The old center line must first disappear. The two center sensors must then
+   see the new line for two consecutive loops.
+5. The car drives straight at speed 105 for six loops (about 120 ms), resets
+   PID history, and resumes normal tracking.
+
+No MPU6050 input is used in this version. The turn is closed-loop with the
+eight-channel grayscale sensor rather than a fixed rotation time.
+
 ## Fault sounds
 
 | Sound | Meaning |
@@ -38,6 +62,7 @@ paths through the core board or motor driver.
 | 4 short beeps | No valid 1-to-4-sensor line was present at startup |
 | 2 long beeps | Line was lost for about 0.8 seconds |
 | 3 short beeps | Six or more sensors stayed black for about 0.5 seconds |
+| 5 short beeps | Corner pivot did not reacquire the line in about 1.2 seconds |
 
 All motion faults send two zero-speed commands before sounding the buzzer.
 
@@ -49,6 +74,9 @@ All motion faults send two zero-speed commands before sounding the buzzer.
 - Maximum wheel command: 320
 - PID: Kp = 0.45, Ki = 0, Kd = 0.70
 - Maximum steering correction: 160
+- Right-angle forward compensation: about 160 ms at speed 110
+- Right-angle pivot speed: 135
+- Post-turn settling: about 120 ms at speed 105
 
 The verified motor order is:
 
@@ -63,6 +91,14 @@ Left/right differential steering therefore groups M1 with M3 and M2 with M4.
 
 The integral path and anti-windup are implemented, but Ki starts at zero for
 safe first tuning. PID constants are grouped at the top of the C source.
+
+For first right-angle tuning, change only one setting at a time:
+
+1. If the car pivots too early or late, adjust `CORNER_APPROACH_CYCLES` by one
+   loop (about 20 ms).
+2. If it cannot rotate against floor friction or overshoots badly, adjust
+   `CORNER_PIVOT_SPEED`.
+3. Only after those are stable should PID gains be changed.
 
 Channel 0 is initially treated as the physical left side. If the first
 raised-wheel test proves that steering correction is reversed, change
