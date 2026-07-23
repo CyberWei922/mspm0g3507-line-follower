@@ -1,0 +1,71 @@
+/**
+ * Yahboom 8-channel black-line PID follower for MSPM0G3507 LQFP-64.
+ */
+//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
+//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
+// @cliArgs --board /ti/boards/LP_MSPM0G3507 --rtos nortos
+
+const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const GPIO1  = GPIO.addInstance();
+const GPIO2  = GPIO.addInstance();
+const GPIO3  = GPIO.addInstance();
+const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
+const PWM1   = PWM.addInstance();
+const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
+
+GPIO1.$name                         = "GPIO_LEDS";
+GPIO1.port                          = "PORTB";
+GPIO1.associatedPins.create(2);
+GPIO1.associatedPins[0].$name       = "USER_LED_1";
+GPIO1.associatedPins[0].assignedPin = "2";
+GPIO1.associatedPins[1].$name       = "USER_LED_2";
+GPIO1.associatedPins[1].assignedPin = "3";
+
+/* Yahboom motor-driver software I2C. */
+GPIO2.$name                              = "GPIO_I2C";
+GPIO2.port                               = "PORTA";
+GPIO2.associatedPins.create(2);
+GPIO2.associatedPins[0].$name            = "SCL";
+GPIO2.associatedPins[0].direction        = "INPUT";
+GPIO2.associatedPins[0].internalResistor = "PULL_UP";
+GPIO2.associatedPins[0].assignedPin      = "12";
+GPIO2.associatedPins[1].$name            = "SDA";
+GPIO2.associatedPins[1].direction        = "INPUT";
+GPIO2.associatedPins[1].internalResistor = "PULL_UP";
+GPIO2.associatedPins[1].assignedPin      = "13";
+
+/* User-confirmed grayscale wiring. */
+GPIO3.$name                           = "GPIO_GRAY8";
+GPIO3.port                            = "PORTA";
+GPIO3.associatedPins.create(4);
+GPIO3.associatedPins[0].$name         = "OUT";
+GPIO3.associatedPins[0].direction     = "INPUT";
+GPIO3.associatedPins[0].assignedPin   = "14";
+GPIO3.associatedPins[1].$name         = "AD0";
+GPIO3.associatedPins[1].direction     = "OUTPUT";
+GPIO3.associatedPins[1].initialValue  = "CLEARED";
+GPIO3.associatedPins[1].assignedPin   = "15";
+GPIO3.associatedPins[2].$name         = "AD1";
+GPIO3.associatedPins[2].direction     = "OUTPUT";
+GPIO3.associatedPins[2].initialValue  = "CLEARED";
+GPIO3.associatedPins[2].assignedPin   = "16";
+GPIO3.associatedPins[3].$name         = "AD2";
+GPIO3.associatedPins[3].direction     = "OUTPUT";
+GPIO3.associatedPins[3].initialValue  = "CLEARED";
+GPIO3.associatedPins[3].assignedPin   = "17";
+
+/* Yahboom expansion-board buzzer: PB24 -> TIMA0 CCP3. */
+PWM1.$name                      = "BUZZER";
+PWM1.clockPrescale              = 256;
+PWM1.timerCount                 = 99;
+PWM1.ccIndex                    = [3];
+PWM1.pwmMode                    = "EDGE_ALIGN_UP";
+PWM1.peripheral.$assign         = "TIMA0";
+PWM1.peripheral.ccp3Pin.$assign = "PB24";
+PWM1.PWM_CHANNEL_3.$name        = "GPIO_BUZZER";
+PWM1.PWM_CHANNEL_3.dutyCycle    = 0;
+
+const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+SYSCTL.forceDefaultClkConfig = true;
+SYSCTL.clockTreeEn           = true;

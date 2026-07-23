@@ -1,0 +1,27 @@
+# CCS / SysConfig generated build output
+build/
+Debug/
+Release/
+
+# CCS imported-project metadata (projectspec remains the source of truth)
+.project
+.cproject
+.ccsproject
+.settings/
+targetConfigs/
+
+# Compiler and linker products
+*.obj
+*.o
+*.out
+*.elf
+*.hex
+*.bin
+*.map
+*.d
+*.d_raw
+*.mk
+*_linkInfo.xml
+
+# macOS
+.DS_Store
