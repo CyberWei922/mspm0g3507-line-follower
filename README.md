@@ -37,19 +37,24 @@ changes:
 
 - each of the eight digital sensors uses a three-scan majority vote;
 - the derivative term is low-pass filtered, so a single sensor-edge spike does
-  not create a large steering kick.
+  not create a large steering kick;
+- tracking commands change by at most 35 units per control loop;
+- on high-friction cloth, both sides keep at least speed 120 instead of
+  stopping the inner wheels and dragging them sideways.
 
 A confirmed right-angle pattern enters this non-blocking state sequence:
 
 1. The same left/right corner must be detected for two consecutive loops.
-2. Both sides drive at speed 110 for eight loops (about 160 ms). This moves the
+2. Both sides drive at speed 150 for eight loops (about 160 ms). This moves the
    wheel rotation center toward the corner instead of pivoting as soon as the
    front sensor bar sees it.
-3. The chassis pivots in place at speed 135 toward the detected side.
-4. The old center line must first disappear. The two center sensors must then
-   see the new line for two consecutive loops.
-5. The car drives straight at speed 105 for six loops (about 120 ms), resets
-   PID history, and resumes normal tracking.
+3. The chassis pivots in place at speed 195 toward the detected side.
+4. The old center line must first disappear and the pivot must last at least
+   ten loops (about 200 ms). A valid 1-to-3-sensor line must then remain within
+   75 position units of center for four consecutive loops.
+5. The car uses reduced-correction PID at speed 155 for eight loops (about
+   160 ms), resets PID history, and resumes normal tracking. If the line
+   disappears during this phase, it returns to pivot/reacquisition.
 
 No MPU6050 input is used in this version. The turn is closed-loop with the
 eight-channel grayscale sensor rather than a fixed rotation time.
@@ -70,13 +75,16 @@ All motion faults send two zero-speed commands before sounding the buzzer.
 
 - Approximate control period: 20 ms
 - Normal base speed: 190
-- Minimum corner speed: 110
+- Minimum normal-corner base speed: 165
+- Minimum tracking wheel speed on cloth: 120
 - Maximum wheel command: 320
 - PID: Kp = 0.45, Ki = 0, Kd = 0.70
-- Maximum steering correction: 160
-- Right-angle forward compensation: about 160 ms at speed 110
-- Right-angle pivot speed: 135
-- Post-turn settling: about 120 ms at speed 105
+- Maximum steering correction: 145
+- Per-loop command slew limit: 35
+- Right-angle forward compensation: about 160 ms at speed 150
+- Right-angle pivot speed: 195
+- Minimum right-angle pivot time: about 200 ms
+- Post-turn PID settling: about 160 ms at speed 155
 
 The verified motor order is:
 
@@ -97,7 +105,7 @@ For first right-angle tuning, change only one setting at a time:
 1. If the car pivots too early or late, adjust `CORNER_APPROACH_CYCLES` by one
    loop (about 20 ms).
 2. If it cannot rotate against floor friction or overshoots badly, adjust
-   `CORNER_PIVOT_SPEED`.
+   `CORNER_PIVOT_SPEED` in steps of 10.
 3. Only after those are stable should PID gains be changed.
 
 Channel 0 is initially treated as the physical left side. If the first

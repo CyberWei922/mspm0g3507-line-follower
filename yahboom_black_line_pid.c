@@ -36,15 +36,19 @@
 #define GRAY8_CHANNEL0_IS_LEFT (1U)
 
 #define BASE_SPEED          ((int16_t) 190)
-#define MIN_CORNER_SPEED    ((int16_t) 110)
-#define LOST_SEARCH_SPEED   ((int16_t) 100)
-#define WIDE_MARK_SPEED     ((int16_t) 90)
+#define MIN_CORNER_SPEED    ((int16_t) 165)
+#define MIN_TRACKING_WHEEL_SPEED ((int16_t) 120)
+#define LOST_SEARCH_SPEED   ((int16_t) 135)
+#define WIDE_MARK_SPEED     ((int16_t) 125)
 #define MAX_WHEEL_SPEED     ((int16_t) 320)
-#define MAX_PID_CORRECTION  ((int16_t) 160)
-#define CORNER_APPROACH_SPEED ((int16_t) 110)
-#define CORNER_PIVOT_SPEED    ((int16_t) 135)
-#define CORNER_SETTLE_SPEED   ((int16_t) 105)
-#define LOST_PIVOT_SPEED      ((int16_t) 90)
+#define MAX_PID_CORRECTION  ((int16_t) 145)
+#define TRACKING_COMMAND_SLEW_STEP ((int16_t) 35)
+#define CORNER_APPROACH_SPEED ((int16_t) 150)
+#define CORNER_PIVOT_SPEED    ((int16_t) 195)
+#define CORNER_SETTLE_SPEED   ((int16_t) 155)
+#define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 80)
+#define CORNER_CENTER_ERROR_LIMIT ((int16_t) 75)
+#define LOST_PIVOT_SPEED      ((int16_t) 135)
 
 /* Fixed-point PID gains: Kp=0.45, Ki=0, Kd=0.70 initially. */
 #define PID_KP_NUM          (45L)
@@ -60,8 +64,9 @@
 #define STARTUP_SAMPLE_COUNT   (32U)
 #define CORNER_CONFIRM_CYCLES       (2U)
 #define CORNER_APPROACH_CYCLES      (8U)
-#define CORNER_REACQUIRE_CYCLES     (2U)
-#define CORNER_SETTLE_CYCLES        (6U)
+#define CORNER_MIN_PIVOT_CYCLES     (10U)
+#define CORNER_REACQUIRE_CYCLES     (4U)
+#define CORNER_SETTLE_CYCLES        (8U)
 #define CORNER_TURN_TIMEOUT_CYCLES  (60U)
 #define LOST_PIVOT_AFTER_CYCLES     (5U)
 
@@ -123,6 +128,8 @@ volatile bool gWhiteLevelIsHigh;
 volatile int16_t gLinePosition;
 volatile int16_t gFilteredError;
 volatile int16_t gPidCorrection;
+volatile int16_t gLeftTarget;
+volatile int16_t gRightTarget;
 volatile int16_t gLeftCommand;
 volatile int16_t gRightCommand;
 volatile uint32_t gControlCycles;
@@ -137,6 +144,9 @@ static int16_t sPreviousError;
 static int16_t sLastValidError;
 static int16_t sFilteredDerivative;
 static int32_t sIntegral;
+static int16_t sTrackingLeftCommand;
+static int16_t sTrackingRightCommand;
+static bool sTrackingCommandInitialized;
 static CornerDirection sCornerCandidate;
 static bool sCornerOldLineCleared;
 
@@ -294,15 +304,32 @@ static bool setAllMotorSpeeds(
         MOTOR_SPEED_REGISTER, payload, (uint8_t) sizeof(payload));
 }
 
-static int16_t clampWheelCommand(int32_t speed)
+static int16_t clampTrackingWheelCommand(int32_t speed)
 {
-    if (speed < 0L) {
-        return 0;
+    /*
+     * Four-wheel skid steering on cloth needs both sides to keep rolling.
+     * Commands below this floor entered the observed low-speed/stall region.
+     */
+    if (speed < MIN_TRACKING_WHEEL_SPEED) {
+        return MIN_TRACKING_WHEEL_SPEED;
     }
     if (speed > MAX_WHEEL_SPEED) {
         return MAX_WHEEL_SPEED;
     }
     return (int16_t) speed;
+}
+
+static int16_t slewTrackingCommand(int16_t current, int16_t target)
+{
+    int32_t difference = (int32_t) target - current;
+
+    if (difference > TRACKING_COMMAND_SLEW_STEP) {
+        return (int16_t) (current + TRACKING_COMMAND_SLEW_STEP);
+    }
+    if (difference < -TRACKING_COMMAND_SLEW_STEP) {
+        return (int16_t) (current - TRACKING_COMMAND_SLEW_STEP);
+    }
+    return target;
 }
 
 static bool setChassisSpeed(int16_t left, int16_t right)
@@ -631,6 +658,7 @@ static void beginCorner(CornerDirection direction)
     sCornerOldLineCleared = false;
     sCornerCandidate = CORNER_NONE;
     gCornerConfirmCycles = 0U;
+    sTrackingCommandInitialized = false;
     pidReset(sLastValidError);
     greenLed(false);
     blueLed(true);
@@ -638,9 +666,20 @@ static void beginCorner(CornerDirection direction)
 
 static void cornerControlStep(void)
 {
-    bool centerDetected =
-        ((gBlackMask & CENTER_SENSOR_MASK) != 0U) &&
-        (gActiveSensorCount >= 1U) && (gActiveSensorCount <= 4U);
+    int16_t sensedPosition = 0;
+    int16_t settleCorrection;
+    bool lineShapeValid =
+        (gActiveSensorCount >= 1U) && (gActiveSensorCount <= 3U);
+    bool centerAligned = false;
+
+    if (lineShapeValid) {
+        sensedPosition =
+            blackMaskToPosition(gBlackMask, gActiveSensorCount);
+        centerAligned =
+            ((gBlackMask & CENTER_SENSOR_MASK) != 0U) &&
+            (sensedPosition >= -CORNER_CENTER_ERROR_LIMIT) &&
+            (sensedPosition <= CORNER_CENTER_ERROR_LIMIT);
+    }
 
     if (gFollowState == FOLLOW_STATE_CORNER_APPROACH) {
         commandChassisOrFault(CORNER_APPROACH_SPEED, CORNER_APPROACH_SPEED);
@@ -665,16 +704,21 @@ static void cornerControlStep(void)
         }
 
         gCornerPhaseCycles++;
-        if (!centerDetected) {
+        /*
+         * Seeing the center briefly is not enough: the old corner edge must
+         * disappear, a minimum pivot time must pass, and the new line must
+         * remain close to center for several complete control loops.
+         */
+        if (!centerAligned) {
             sCornerOldLineCleared = true;
             gCornerReacquireCycles = 0U;
-        } else if (sCornerOldLineCleared) {
+        } else if (sCornerOldLineCleared &&
+                   (gCornerPhaseCycles >= CORNER_MIN_PIVOT_CYCLES)) {
             gCornerReacquireCycles++;
             if (gCornerReacquireCycles >= CORNER_REACQUIRE_CYCLES) {
                 gFollowState = FOLLOW_STATE_CORNER_SETTLE;
                 gCornerPhaseCycles = 0U;
-                gLinePosition =
-                    blackMaskToPosition(gBlackMask, gActiveSensorCount);
+                gLinePosition = sensedPosition;
                 gFilteredError = gLinePosition;
                 sLastValidError = gLinePosition;
                 pidReset(gLinePosition);
@@ -687,13 +731,47 @@ static void cornerControlStep(void)
         return;
     }
 
-    /* Drive slowly across the corner before returning control to PID. */
-    commandChassisOrFault(CORNER_SETTLE_SPEED, CORNER_SETTLE_SPEED);
+    /*
+     * Use low-speed PID while leaving the corner instead of driving blindly
+     * straight. If the line disappears, return to pivot/reacquisition.
+     */
+    if (!lineShapeValid) {
+        gFollowState = FOLLOW_STATE_CORNER_PIVOT;
+        gCornerPhaseCycles = CORNER_MIN_PIVOT_CYCLES;
+        gCornerReacquireCycles = 0U;
+        sCornerOldLineCleared = true;
+        if (gCornerDirection == CORNER_LEFT) {
+            commandChassisOrFault(
+                (int16_t) -CORNER_PIVOT_SPEED, CORNER_PIVOT_SPEED);
+        } else {
+            commandChassisOrFault(
+                CORNER_PIVOT_SPEED, (int16_t) -CORNER_PIVOT_SPEED);
+        }
+        return;
+    }
+
+    gLinePosition = sensedPosition;
+    gFilteredError =
+        (int16_t) (((int32_t) gFilteredError + gLinePosition) / 2L);
+    sLastValidError = gFilteredError;
+    settleCorrection = pidUpdate(gFilteredError);
+    if (settleCorrection > CORNER_SETTLE_MAX_CORRECTION) {
+        settleCorrection = CORNER_SETTLE_MAX_CORRECTION;
+    } else if (settleCorrection < -CORNER_SETTLE_MAX_CORRECTION) {
+        settleCorrection = (int16_t) -CORNER_SETTLE_MAX_CORRECTION;
+    }
+
+    commandChassisOrFault(
+        clampTrackingWheelCommand(
+            (int32_t) CORNER_SETTLE_SPEED + settleCorrection),
+        clampTrackingWheelCommand(
+            (int32_t) CORNER_SETTLE_SPEED - settleCorrection));
     gCornerPhaseCycles++;
     if (gCornerPhaseCycles >= CORNER_SETTLE_CYCLES) {
         gFollowState = FOLLOW_STATE_RUNNING;
         gCornerDirection = CORNER_NONE;
         gCornerPhaseCycles = 0U;
+        sTrackingCommandInitialized = false;
         pidReset(sLastValidError);
         greenLed(true);
         blueLed(false);
@@ -750,6 +828,7 @@ static void lineFollowerStep(void)
         }
 
         if (gLostLineCycles >= LOST_PIVOT_AFTER_CYCLES) {
+            sTrackingCommandInitialized = false;
             if (sLastValidError <= 0) {
                 commandChassisOrFault(
                     (int16_t) -LOST_PIVOT_SPEED, LOST_PIVOT_SPEED);
@@ -789,12 +868,24 @@ static void lineFollowerStep(void)
     }
 
     gPidCorrection = pidUpdate(controlError);
-    gLeftCommand =
-        clampWheelCommand((int32_t) baseSpeed + gPidCorrection);
-    gRightCommand =
-        clampWheelCommand((int32_t) baseSpeed - gPidCorrection);
+    gLeftTarget =
+        clampTrackingWheelCommand((int32_t) baseSpeed + gPidCorrection);
+    gRightTarget =
+        clampTrackingWheelCommand((int32_t) baseSpeed - gPidCorrection);
 
-    commandChassisOrFault(gLeftCommand, gRightCommand);
+    if (!sTrackingCommandInitialized) {
+        sTrackingLeftCommand = gLeftTarget;
+        sTrackingRightCommand = gRightTarget;
+        sTrackingCommandInitialized = true;
+    } else {
+        sTrackingLeftCommand =
+            slewTrackingCommand(sTrackingLeftCommand, gLeftTarget);
+        sTrackingRightCommand =
+            slewTrackingCommand(sTrackingRightCommand, gRightTarget);
+    }
+
+    commandChassisOrFault(
+        sTrackingLeftCommand, sTrackingRightCommand);
 
     gControlCycles++;
 }
@@ -868,6 +959,9 @@ int main(void)
     gCornerConfirmCycles = 0U;
     gCornerPhaseCycles = 0U;
     gCornerReacquireCycles = 0U;
+    gLeftTarget = BASE_SPEED;
+    gRightTarget = BASE_SPEED;
+    sTrackingCommandInitialized = false;
     pidReset(gLinePosition);
 
     gFollowState = FOLLOW_STATE_RUNNING;
