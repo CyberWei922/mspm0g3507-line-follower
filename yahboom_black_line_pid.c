@@ -35,27 +35,27 @@
  */
 #define GRAY8_CHANNEL0_IS_LEFT (1U)
 
-#define BASE_SPEED          ((int16_t) 190)
-#define MIN_CORNER_SPEED    ((int16_t) 165)
-#define MIN_TRACKING_WHEEL_SPEED ((int16_t) 120)
-#define LOST_SEARCH_SPEED   ((int16_t) 135)
-#define WIDE_MARK_SPEED     ((int16_t) 125)
+#define BASE_SPEED          ((int16_t) 230)
+#define MIN_CORNER_SPEED    ((int16_t) 180)
+#define MIN_TRACKING_WHEEL_SPEED ((int16_t) 135)
+#define LOST_SEARCH_SPEED   ((int16_t) 155)
+#define WIDE_MARK_SPEED     ((int16_t) 145)
 #define MAX_WHEEL_SPEED     ((int16_t) 320)
-#define MAX_PID_CORRECTION  ((int16_t) 145)
-#define TRACKING_COMMAND_SLEW_STEP ((int16_t) 35)
-#define CORNER_APPROACH_SPEED ((int16_t) 150)
-#define CORNER_PIVOT_SPEED    ((int16_t) 195)
-#define CORNER_SETTLE_SPEED   ((int16_t) 155)
-#define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 80)
+#define MAX_PID_CORRECTION  ((int16_t) 175)
+#define TRACKING_COMMAND_SLEW_STEP ((int16_t) 55)
+#define CORNER_APPROACH_SPEED ((int16_t) 175)
+#define CORNER_PIVOT_SPEED    ((int16_t) 235)
+#define CORNER_SETTLE_SPEED   ((int16_t) 180)
+#define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 100)
 #define CORNER_CENTER_ERROR_LIMIT ((int16_t) 75)
-#define LOST_PIVOT_SPEED      ((int16_t) 135)
+#define LOST_PIVOT_SPEED      ((int16_t) 155)
 
-/* Fixed-point PID gains: Kp=0.45, Ki=0, Kd=0.70 initially. */
-#define PID_KP_NUM          (45L)
+/* Responsive cloth-track tuning: Kp=0.60, Ki=0, Kd=0.55. */
+#define PID_KP_NUM          (60L)
 #define PID_KP_DEN          (100L)
 #define PID_KI_NUM          (0L)
 #define PID_KI_DEN          (10000L)
-#define PID_KD_NUM          (70L)
+#define PID_KD_NUM          (55L)
 #define PID_KD_DEN          (100L)
 #define PID_INTEGRAL_LIMIT  (8000L)
 
@@ -64,10 +64,10 @@
 #define STARTUP_SAMPLE_COUNT   (32U)
 #define CORNER_CONFIRM_CYCLES       (2U)
 #define CORNER_APPROACH_CYCLES      (8U)
-#define CORNER_MIN_PIVOT_CYCLES     (10U)
+#define CORNER_MIN_PIVOT_CYCLES     (16U)
 #define CORNER_REACQUIRE_CYCLES     (4U)
 #define CORNER_SETTLE_CYCLES        (8U)
-#define CORNER_TURN_TIMEOUT_CYCLES  (60U)
+#define CORNER_TURN_TIMEOUT_CYCLES  (80U)
 #define LOST_PIVOT_AFTER_CYCLES     (5U)
 
 #define DELAY_5_MS         ((CPUCLK_FREQ / 1000U) * 5U)
@@ -554,7 +554,7 @@ static int16_t pidUpdate(int16_t error)
      * Ki remains zero initially, but this avoids windup if it is tuned later.
      */
     sFilteredDerivative =
-        (int16_t) (((3L * sFilteredDerivative) + rawDerivative) / 4L);
+        (int16_t) (((int32_t) sFilteredDerivative + rawDerivative) / 2L);
 
     if (magnitude < 0L) {
         magnitude = -magnitude;
@@ -751,8 +751,8 @@ static void cornerControlStep(void)
     }
 
     gLinePosition = sensedPosition;
-    gFilteredError =
-        (int16_t) (((int32_t) gFilteredError + gLinePosition) / 2L);
+    gFilteredError = (int16_t) (
+        ((int32_t) gFilteredError + (3L * gLinePosition)) / 4L);
     sLastValidError = gFilteredError;
     settleCorrection = pidUpdate(gFilteredError);
     if (settleCorrection > CORNER_SETTLE_MAX_CORRECTION) {
@@ -859,9 +859,9 @@ static void lineFollowerStep(void)
         gLinePosition =
             blackMaskToPosition(gBlackMask, gActiveSensorCount);
 
-        /* One-pole digital smoothing: 50% previous, 50% newest. */
-        gFilteredError =
-            (int16_t) (((int32_t) gFilteredError + gLinePosition) / 2L);
+        /* Favor the newest sample so correction starts before a large drift. */
+        gFilteredError = (int16_t) (
+            ((int32_t) gFilteredError + (3L * gLinePosition)) / 4L);
         controlError = gFilteredError;
         sLastValidError = controlError;
         baseSpeed = scheduledBaseSpeed(controlError);
