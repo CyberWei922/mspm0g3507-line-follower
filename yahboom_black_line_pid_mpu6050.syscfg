@@ -9,6 +9,7 @@ const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1  = GPIO.addInstance();
 const GPIO2  = GPIO.addInstance();
 const GPIO3  = GPIO.addInstance();
+const GPIO4  = GPIO.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
 const PWM1   = PWM.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
@@ -53,6 +54,19 @@ GPIO3.associatedPins[3].$name         = "AD2";
 GPIO3.associatedPins[3].direction     = "OUTPUT";
 GPIO3.associatedPins[3].initialValue  = "CLEARED";
 GPIO3.associatedPins[3].assignedPin   = "17";
+
+/* MPU6050 software I2C. AD0 is wired to GND, so the address is 0x68. */
+GPIO4.$name                          = "MPU6050";
+GPIO4.port                           = "PORTA";
+GPIO4.associatedPins.create(2);
+GPIO4.associatedPins[0].$name        = "IMU_SCL";
+GPIO4.associatedPins[0].initialValue = "SET";
+GPIO4.associatedPins[0].ioStructure  = "OD";
+GPIO4.associatedPins[0].assignedPin  = "1";
+GPIO4.associatedPins[1].$name        = "IMU_SDA";
+GPIO4.associatedPins[1].initialValue = "SET";
+GPIO4.associatedPins[1].ioStructure  = "OD";
+GPIO4.associatedPins[1].assignedPin  = "0";
 
 /* Yahboom expansion-board buzzer: PB24 -> TIMA0 CCP3. */
 PWM1.$name                      = "BUZZER";

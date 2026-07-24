@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<projectSpec>
+    <applicability>
+        <when>
+            <context deviceFamily="ARM" deviceId="MSPM0G3507" />
+        </when>
+    </applicability>
+    <project
+        title="yahboom_black_line_pid_mpu6050"
+        name="yahboom_black_line_pid_mpu6050_LP_MSPM0G3507_nortos_ticlang"
+        configurations="Debug"
+        toolChain="TICLANG"
+        connection="TIXDS110_Connection.xml"
+        device="MSPM0G3507"
+        ignoreDefaultDeviceSettings="true"
+        ignoreDefaultCCSSettings="true"
+        products="MSPM0-SDK;sysconfig"
+        compilerBuildOptions="
+            -I${PROJECT_ROOT}
+            -I${PROJECT_ROOT}/mpu6050
+            -I${PROJECT_ROOT}/${ConfigName}
+            -O2
+            @device.opt
+            -I${COM_TI_MSPM0_SDK_INSTALL_DIR}/source/third_party/CMSIS/Core/Include
+            -I${COM_TI_MSPM0_SDK_INSTALL_DIR}/source
+            -mcpu=cortex-m0plus
+            -march=thumbv6m
+            -mfloat-abi=soft
+            -mthumb
+            -Wall
+        "
+        linkerBuildOptions="
+            -ldevice.cmd.genlibs
+            -L${COM_TI_MSPM0_SDK_INSTALL_DIR}/source
+            -L${PROJECT_ROOT}
+            -L${PROJECT_BUILD_DIR}/syscfg
+            -Wl,--rom_model
+            -Wl,--warn_sections
+            -Wl,--stack_size=2048
+            -Wl,--heap_size=512
+            -L${CG_TOOL_ROOT}/lib
+            -llibc.a
+        "
+        sysConfigBuildOptions="
+            --output .
+            --product ${COM_TI_MSPM0_SDK_INSTALL_DIR}/.metadata/product.json
+            --compiler ticlang
+        "
+        sourceLookupPath="${COM_TI_MSPM0_SDK_INSTALL_DIR}/source/ti/driverlib"
+        description="Follow an 18 mm black tape line with grayscale pattern steering and MPU6050 angle feedback">
+        <property name="buildProfile" value="release"/>
+        <property name="isHybrid" value="true"/>
+        <file path="../yahboom_black_line_pid_mpu6050.c" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../firmware_version.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../VERSION" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../README.md" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../yahboom_black_line_pid_mpu6050.syscfg" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/imu_mpu6050.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/imu_mpu6050.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/bsp_mpu6050.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/bsp_mpu6050.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/inv_mpu.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/inv_mpu.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/inv_mpu_dmp_motion_driver.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/inv_mpu_dmp_motion_driver.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/dmpKey.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/dmpmap.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/delay.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
+        <file path="../mpu6050/delay.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
+    </project>
+</projectSpec>

@@ -1,5 +1,5 @@
 /*
- * Yahboom 8-channel black-line PID follower for MSPM0G3507.
+ * Yahboom 8-channel black-line PID follower with MPU6050 feedback.
  *
  * Safe behavior:
  *   - power-on/debugger resets command stop and wait
@@ -12,13 +12,19 @@
  * Wiring:
  *   PA12 SCL, PA13 SDA (Yahboom motor driver, software I2C)
  *   PA14 OUT, PA15 AD0, PA16 AD1, PA17 AD2 (8-channel grayscale)
+ *   PA1 SCL, PA0 SDA (MPU6050, software I2C; AD0 is wired to GND)
  *   PB24 expansion-board buzzer (TIMA0 CCP3 PWM)
  */
 
 #include "ti_msp_dl_config.h"
+#include "firmware_version.h"
+#include "imu_mpu6050.h"
 
 #include <stdbool.h>
 #include <stdint.h>
+
+/* Kept in the image so CCS/debugger can inspect the exact firmware build. */
+const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 
 #define MOTOR_I2C_7BIT_ADDRESS (0x26U)
 #define MOTOR_SPEED_REGISTER   (0x06U)
@@ -35,20 +41,55 @@
  */
 #define GRAY8_CHANNEL0_IS_LEFT (1U)
 
-#define BASE_SPEED          ((int16_t) 230)
-#define MIN_CORNER_SPEED    ((int16_t) 180)
 #define MIN_TRACKING_WHEEL_SPEED ((int16_t) 135)
-#define LOST_SEARCH_SPEED   ((int16_t) 155)
-#define WIDE_MARK_SPEED     ((int16_t) 145)
 #define MAX_WHEEL_SPEED     ((int16_t) 320)
 #define MAX_PID_CORRECTION  ((int16_t) 175)
-#define TRACKING_COMMAND_SLEW_STEP ((int16_t) 55)
-#define CORNER_APPROACH_SPEED ((int16_t) 175)
-#define CORNER_PIVOT_SPEED    ((int16_t) 235)
-#define CORNER_SETTLE_SPEED   ((int16_t) 180)
-#define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 100)
+#define CORNER_APPROACH_SPEED ((int16_t) 210)
+#define CORNER_PIVOT_SPEED    ((int16_t) 330)
+#define CORNER_PIVOT_SLOW_SPEED ((int16_t) 270)
+#define CORNER_SETTLE_SPEED   ((int16_t) 230)
+#define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 130)
 #define CORNER_CENTER_ERROR_LIMIT ((int16_t) 75)
-#define LOST_PIVOT_SPEED      ((int16_t) 155)
+#define LOST_PIVOT_SPEED      ((int16_t) 210)
+
+#define CORNER_SLOW_ANGLE_DEGREES       (72.0f)
+#define CORNER_REACQUIRE_ANGLE_DEGREES  (78.0f)
+#define CORNER_ABORT_ANGLE_DEGREES      (145.0f)
+
+/*
+ * Positive official pattern error makes the verified chassis turn right.
+ * With the actual component-side-up installation, vehicle left yaw is
+ * positive and right yaw is negative. The desired yaw rate therefore has the
+ * opposite sign to pattern error.
+ *
+ * The desired yaw rate is low-pass filtered so a one-sensor pattern change
+ * cannot instantly reverse the steering demand. Feedback uses
+ * (measured - desired), because a positive motor correction turns the chassis
+ * right (negative yaw). This is deliberately negative feedback: when the
+ * chassis is rotating right too quickly, the added correction becomes
+ * negative and counter-steers left.
+ */
+#define GYRO_TARGET_RATE_PER_ERROR_DPS  (-22.0f)
+#define GYRO_TARGET_FILTER_NEW_WEIGHT   (0.45f)
+#define GYRO_RATE_FEEDBACK_GAIN         (1.60f)
+#define GYRO_CENTER_DAMPING_GAIN        (2.30f)
+#define GYRO_RATE_MAX_CORRECTION        ((int16_t) 70)
+#define IMU_RAW_FAILURE_LIMIT_CYCLES    (5U)
+#define IMU_YAW_STALE_LIMIT_CYCLES      (15U)
+#define STARTUP_PLACEMENT_BLINKS        (2U)
+
+/*
+ * Yahboom official LineWalking controller constants. V_z is converted to a
+ * left/right speed delta using the official 188 mm chassis APB parameter.
+ */
+#define OFFICIAL_IRR_SPEED          ((int16_t) 320)
+#define OFFICIAL_CAR_APB            (188L)
+#define OFFICIAL_TURN_KP            (150L)
+#define OFFICIAL_TURN_KI            (4L)
+#define OFFICIAL_PATTERN_INTEGRAL_LIMIT (80L)
+#define OFFICIAL_TURN_KD_NUM        (1L)
+#define OFFICIAL_TURN_KD_DEN        (2L)
+#define OFFICIAL_MAX_WHEEL_SPEED    ((int16_t) 500)
 
 /* Responsive cloth-track tuning: Kp=0.60, Ki=0, Kd=0.55. */
 #define PID_KP_NUM          (60L)
@@ -64,10 +105,9 @@
 #define STARTUP_SAMPLE_COUNT   (32U)
 #define CORNER_CONFIRM_CYCLES       (2U)
 #define CORNER_APPROACH_CYCLES      (8U)
-#define CORNER_MIN_PIVOT_CYCLES     (16U)
 #define CORNER_REACQUIRE_CYCLES     (4U)
 #define CORNER_SETTLE_CYCLES        (8U)
-#define CORNER_TURN_TIMEOUT_CYCLES  (80U)
+#define CORNER_TURN_TIMEOUT_CYCLES  (120U)
 #define LOST_PIVOT_AFTER_CYCLES     (5U)
 
 #define DELAY_5_MS         ((CPUCLK_FREQ / 1000U) * 5U)
@@ -95,7 +135,8 @@ typedef enum {
     FOLLOW_STATE_START_LINE_FAULT,
     FOLLOW_STATE_LINE_LOST,
     FOLLOW_STATE_WIDE_MARK_FAULT,
-    FOLLOW_STATE_TURN_TIMEOUT
+    FOLLOW_STATE_TURN_TIMEOUT,
+    FOLLOW_STATE_IMU_FAULT
 } FollowState;
 
 typedef enum {
@@ -128,6 +169,7 @@ volatile bool gWhiteLevelIsHigh;
 volatile int16_t gLinePosition;
 volatile int16_t gFilteredError;
 volatile int16_t gPidCorrection;
+volatile int32_t gOfficialPatternIntegral;
 volatile int16_t gLeftTarget;
 volatile int16_t gRightTarget;
 volatile int16_t gLeftCommand;
@@ -139,16 +181,27 @@ volatile uint16_t gCornerPhaseCycles;
 volatile uint8_t gCornerConfirmCycles;
 volatile uint8_t gCornerReacquireCycles;
 volatile uint32_t gI2cErrorCount;
+volatile float gCornerStartYaw;
+volatile float gCornerSignedYawDelta;
+volatile float gCornerTurnAngle;
+volatile float gGyroTargetRateDps;
+volatile float gGyroRateErrorDps;
+volatile int16_t gGyroAssistCorrection;
+volatile uint16_t gImuRawFailureCycles;
+volatile uint16_t gImuYawStaleCycles;
 
 static int16_t sPreviousError;
 static int16_t sLastValidError;
 static int16_t sFilteredDerivative;
 static int32_t sIntegral;
-static int16_t sTrackingLeftCommand;
-static int16_t sTrackingRightCommand;
-static bool sTrackingCommandInitialized;
+static int8_t sOfficialPatternError;
+static int8_t sOfficialPreviousError;
+static int32_t sOfficialPatternIntegral;
+static uint8_t sOfficialTurnFlag;
 static CornerDirection sCornerCandidate;
 static bool sCornerOldLineCleared;
+static bool sCornerYawCaptured;
+static float sFilteredGyroTargetRateDps;
 
 static const int16_t sLineWeights[8] = {
     -350, -250, -150, -50, 50, 150, 250, 350
@@ -317,19 +370,6 @@ static int16_t clampTrackingWheelCommand(int32_t speed)
         return MAX_WHEEL_SPEED;
     }
     return (int16_t) speed;
-}
-
-static int16_t slewTrackingCommand(int16_t current, int16_t target)
-{
-    int32_t difference = (int32_t) target - current;
-
-    if (difference > TRACKING_COMMAND_SLEW_STEP) {
-        return (int16_t) (current + TRACKING_COMMAND_SLEW_STEP);
-    }
-    if (difference < -TRACKING_COMMAND_SLEW_STEP) {
-        return (int16_t) (current - TRACKING_COMMAND_SLEW_STEP);
-    }
-    return target;
 }
 
 static bool setChassisSpeed(int16_t left, int16_t right)
@@ -578,22 +618,6 @@ static int16_t pidUpdate(int16_t error)
     return clampPidCorrection(output);
 }
 
-static int16_t scheduledBaseSpeed(int16_t error)
-{
-    int32_t magnitude = error;
-    int32_t reduction;
-
-    if (magnitude < 0L) {
-        magnitude = -magnitude;
-    }
-    if (magnitude > 350L) {
-        magnitude = 350L;
-    }
-
-    reduction = ((BASE_SPEED - MIN_CORNER_SPEED) * magnitude) / 350L;
-    return (int16_t) (BASE_SPEED - reduction);
-}
-
 static bool wasExternalNrst(DL_SYSCTL_RESET_CAUSE resetCause)
 {
     return (resetCause == DL_SYSCTL_RESET_CAUSE_BOOTRST_EXTERNAL_NRST) ||
@@ -649,16 +673,287 @@ static void commandChassisOrFault(int16_t left, int16_t right)
     }
 }
 
+static int16_t clampOfficialWheelCommand(int32_t speed)
+{
+    if (speed > OFFICIAL_MAX_WHEEL_SPEED) {
+        return OFFICIAL_MAX_WHEEL_SPEED;
+    }
+    if (speed < -OFFICIAL_MAX_WHEEL_SPEED) {
+        return (int16_t) -OFFICIAL_MAX_WHEEL_SPEED;
+    }
+    return (int16_t) speed;
+}
+
+/*
+ * Adapter for the official deal_IRdata() API. The official I2C module reports
+ * 0 for black and 1 for white. Our PA14/PA15-17 module is scanned locally and
+ * stores 1 for black in gBlackMask, so the adapter reverses each selected bit.
+ */
+static void deal_IRdata(uint8_t *x1, uint8_t *x2, uint8_t *x3, uint8_t *x4,
+    uint8_t *x5, uint8_t *x6, uint8_t *x7, uint8_t *x8)
+{
+    uint8_t physicalIndex;
+    uint8_t channel;
+    uint8_t whiteValue[8];
+
+    for (physicalIndex = 0U; physicalIndex < 8U; physicalIndex++) {
+#if GRAY8_CHANNEL0_IS_LEFT
+        channel = physicalIndex;
+#else
+        channel = (uint8_t) (7U - physicalIndex);
+#endif
+        whiteValue[physicalIndex] =
+            ((gBlackMask & (uint8_t) (1U << channel)) != 0U) ? 0U : 1U;
+    }
+
+    *x1 = whiteValue[0];
+    *x2 = whiteValue[1];
+    *x3 = whiteValue[2];
+    *x4 = whiteValue[3];
+    *x5 = whiteValue[4];
+    *x6 = whiteValue[5];
+    *x7 = whiteValue[6];
+    *x8 = whiteValue[7];
+}
+
+/*
+ * Official priority table. Unlisted patterns deliberately retain the previous
+ * error, providing the same short-term direction memory as the reference.
+ */
+static int8_t officialPatternError(uint8_t x1, uint8_t x2, uint8_t x3,
+    uint8_t x4, uint8_t x5, uint8_t x6, uint8_t x7, uint8_t x8)
+{
+    if ((x1 == 1U) && (x2 == 1U) && (x3 == 0U) && (x4 == 0U) &&
+        (x5 == 0U) && (x6 == 0U) && (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = 15;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) && (x4 == 1U) &&
+               (x5 == 1U) && (x6 == 1U) && (x7 == 1U) && (x8 == 1U)) {
+        if (sOfficialTurnFlag == 0U) {
+            sOfficialPatternError = 0;
+            sOfficialTurnFlag = 1U;
+        }
+    } else if ((x1 == 0U) && (x2 == 0U) &&
+               (x7 == 0U) && (x8 == 0U)) {
+        sOfficialPatternError = 0;
+        if (sOfficialTurnFlag == 1U) {
+            sOfficialTurnFlag = 0U;
+        }
+    } else if ((x1 == 0U) && (x3 == 0U) && (x4 == 0U) &&
+               (x5 == 0U) && (x8 == 0U)) {
+        sOfficialPatternError = 0;
+    } else if (((x1 == 0U) || (x2 == 0U)) && (x8 == 1U)) {
+        sOfficialPatternError = -15;
+    } else if (((x7 == 0U) || (x8 == 0U)) && (x1 == 1U)) {
+        sOfficialPatternError = 15;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 0U) && (x5 == 1U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = -1;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 0U) &&
+               (x4 == 0U) && (x5 == 1U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = -2;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 0U) &&
+               (x4 == 1U) && (x5 == 1U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = -2;
+    } else if ((x1 == 1U) && (x2 == 0U) && (x3 == 0U) &&
+               (x4 == 1U) && (x5 == 1U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = -3;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 1U) && (x5 == 0U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = 1;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 1U) && (x5 == 0U) && (x6 == 0U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = 2;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 1U) && (x5 == 1U) && (x6 == 0U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = 2;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 1U) && (x5 == 1U) && (x6 == 0U) &&
+               (x7 == 0U) && (x8 == 1U)) {
+        sOfficialPatternError = 3;
+    } else if ((x1 == 1U) && (x2 == 1U) && (x3 == 1U) &&
+               (x4 == 0U) && (x5 == 0U) && (x6 == 1U) &&
+               (x7 == 1U) && (x8 == 1U)) {
+        sOfficialPatternError = 0;
+    }
+
+    return sOfficialPatternError;
+}
+
+static int16_t APP_ELE_PID_Calc(int8_t actualValue)
+{
+    int32_t magnitude = actualValue;
+    int32_t output;
+
+    /*
+     * The gyro can make yaw rate reach zero while the optical error remains
+     * persistently at -1 or +1. This bounded integral is intentionally
+     * attached to the grayscale error, not to yaw rate: it keeps applying a
+     * small lateral correction until the line returns to the center sensors.
+     *
+     * A sign reversal halves the stored correction, and a centered pattern
+     * decays it slowly instead of dropping it abruptly. Sharp patterns bypass
+     * the integral so a corner cannot inherit straight-line compensation.
+     */
+    if (magnitude < 0L) {
+        magnitude = -magnitude;
+    }
+    if (magnitude > 3L) {
+        sOfficialPatternIntegral = 0L;
+    } else if (actualValue == 0) {
+        sOfficialPatternIntegral =
+            (7L * sOfficialPatternIntegral) / 8L;
+    } else {
+        if (((actualValue > 0) && (sOfficialPatternIntegral < 0L)) ||
+            ((actualValue < 0) && (sOfficialPatternIntegral > 0L))) {
+            sOfficialPatternIntegral /= 2L;
+        }
+        sOfficialPatternIntegral += actualValue;
+    }
+
+    if (sOfficialPatternIntegral > OFFICIAL_PATTERN_INTEGRAL_LIMIT) {
+        sOfficialPatternIntegral = OFFICIAL_PATTERN_INTEGRAL_LIMIT;
+    } else if (sOfficialPatternIntegral < -OFFICIAL_PATTERN_INTEGRAL_LIMIT) {
+        sOfficialPatternIntegral = -OFFICIAL_PATTERN_INTEGRAL_LIMIT;
+    }
+
+    gOfficialPatternIntegral = sOfficialPatternIntegral;
+    output =
+        (OFFICIAL_TURN_KP * actualValue) +
+        (OFFICIAL_TURN_KI * sOfficialPatternIntegral) +
+        ((OFFICIAL_TURN_KD_NUM *
+             ((int32_t) actualValue - sOfficialPreviousError)) /
+            OFFICIAL_TURN_KD_DEN);
+    sOfficialPreviousError = actualValue;
+    return (int16_t) output;
+}
+
+static int16_t applyGyroRateFeedback(int16_t patternCorrection)
+{
+    float requestedTargetRate;
+    float feedbackGain;
+    int32_t gyroCorrection;
+
+    /*
+     * The official pattern table remains the primary steering controller.
+     * Gyro feedback is deliberately limited to ordinary -3..+3 patterns so
+     * it damps rapid yaw without fighting sharp/corner handling.
+     */
+    if (!gImuYawValid ||
+        (sOfficialPatternError < -3) ||
+        (sOfficialPatternError > 3) ||
+        (gActiveSensorCount == 0U) ||
+        (gActiveSensorCount >= 6U)) {
+        sFilteredGyroTargetRateDps = 0.0f;
+        gGyroTargetRateDps = 0.0f;
+        gGyroRateErrorDps = 0.0f;
+        gGyroAssistCorrection = 0;
+        return patternCorrection;
+    }
+
+    requestedTargetRate =
+        (float) sOfficialPatternError * GYRO_TARGET_RATE_PER_ERROR_DPS;
+    sFilteredGyroTargetRateDps =
+        (GYRO_TARGET_FILTER_NEW_WEIGHT * requestedTargetRate) +
+        ((1.0f - GYRO_TARGET_FILTER_NEW_WEIGHT) *
+            sFilteredGyroTargetRateDps);
+
+    /*
+     * Stronger damping is used only when the line is centered. While the line
+     * is offset, a gentler gain lets the optical controller initiate the turn
+     * without the gyro fighting it.
+     */
+    feedbackGain = (sOfficialPatternError == 0) ?
+        GYRO_CENTER_DAMPING_GAIN : GYRO_RATE_FEEDBACK_GAIN;
+    gGyroTargetRateDps = sFilteredGyroTargetRateDps;
+    gGyroRateErrorDps = gImuGyroZDps - gGyroTargetRateDps;
+    gyroCorrection =
+        (int32_t) (gGyroRateErrorDps * feedbackGain);
+
+    if (gyroCorrection > GYRO_RATE_MAX_CORRECTION) {
+        gyroCorrection = GYRO_RATE_MAX_CORRECTION;
+    } else if (gyroCorrection < -GYRO_RATE_MAX_CORRECTION) {
+        gyroCorrection = -GYRO_RATE_MAX_CORRECTION;
+    }
+
+    gGyroAssistCorrection = (int16_t) gyroCorrection;
+    return (int16_t) ((int32_t) patternCorrection + gyroCorrection);
+}
+
+/*
+ * Hardware adapter for the official Motion_Car_Control(V_x, 0, V_z) API.
+ * It preserves the verified local motor signs through setChassisSpeed().
+ */
+static void Motion_Car_Control(int16_t velocityX, int16_t velocityY,
+    int16_t velocityZ)
+{
+    int32_t spinSpeed;
+
+    (void) velocityY;
+    spinSpeed = ((int32_t) velocityZ * OFFICIAL_CAR_APB) / 1000L;
+    gLeftTarget =
+        clampOfficialWheelCommand((int32_t) velocityX + spinSpeed);
+    gRightTarget =
+        clampOfficialWheelCommand((int32_t) velocityX - spinSpeed);
+    commandChassisOrFault(gLeftTarget, gRightTarget);
+}
+
+static bool LineCheck(void)
+{
+    return (gActiveSensorCount != 0U);
+}
+
+static void LineWalking(void)
+{
+    uint8_t x1;
+    uint8_t x2;
+    uint8_t x3;
+    uint8_t x4;
+    uint8_t x5;
+    uint8_t x6;
+    uint8_t x7;
+    uint8_t x8;
+
+    deal_IRdata(&x1, &x2, &x3, &x4, &x5, &x6, &x7, &x8);
+    sOfficialPatternError =
+        officialPatternError(x1, x2, x3, x4, x5, x6, x7, x8);
+
+    gLinePosition = (int16_t) (sOfficialPatternError * 100);
+    gFilteredError = gLinePosition;
+    gPidCorrection =
+        applyGyroRateFeedback(APP_ELE_PID_Calc(sOfficialPatternError));
+
+    if (LineCheck()) {
+        sLastValidError = gLinePosition;
+    }
+
+    Motion_Car_Control(OFFICIAL_IRR_SPEED, 0, gPidCorrection);
+}
+
 static void beginCorner(CornerDirection direction)
 {
     gCornerDirection = direction;
     gFollowState = FOLLOW_STATE_CORNER_APPROACH;
     gCornerPhaseCycles = 0U;
     gCornerReacquireCycles = 0U;
+    gCornerSignedYawDelta = 0.0f;
+    gCornerTurnAngle = 0.0f;
     sCornerOldLineCleared = false;
+    sCornerYawCaptured = false;
     sCornerCandidate = CORNER_NONE;
     gCornerConfirmCycles = 0U;
-    sTrackingCommandInitialized = false;
+    sOfficialPatternIntegral = 0L;
+    gOfficialPatternIntegral = 0L;
+    sFilteredGyroTargetRateDps = 0.0f;
+    gGyroTargetRateDps = 0.0f;
+    gGyroRateErrorDps = 0.0f;
+    gGyroAssistCorrection = 0;
     pidReset(sLastValidError);
     greenLed(false);
     blueLed(true);
@@ -668,6 +963,7 @@ static void cornerControlStep(void)
 {
     int16_t sensedPosition = 0;
     int16_t settleCorrection;
+    int16_t pivotSpeed = CORNER_PIVOT_SPEED;
     bool lineShapeValid =
         (gActiveSensorCount >= 1U) && (gActiveSensorCount <= 3U);
     bool centerAligned = false;
@@ -686,6 +982,13 @@ static void cornerControlStep(void)
         gCornerPhaseCycles++;
 
         if (gCornerPhaseCycles >= CORNER_APPROACH_CYCLES) {
+            if (!gImuYawValid) {
+                stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+            }
+            gCornerStartYaw = gImuYawUnwrappedDegrees;
+            gCornerSignedYawDelta = 0.0f;
+            gCornerTurnAngle = 0.0f;
+            sCornerYawCaptured = true;
             gFollowState = FOLLOW_STATE_CORNER_PIVOT;
             gCornerPhaseCycles = 0U;
             gCornerReacquireCycles = 0U;
@@ -695,12 +998,33 @@ static void cornerControlStep(void)
     }
 
     if (gFollowState == FOLLOW_STATE_CORNER_PIVOT) {
+        if (!sCornerYawCaptured || !gImuYawValid) {
+            stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+        }
+
+        gCornerSignedYawDelta =
+            IMU_MPU6050_signedRelativeAngle(gCornerStartYaw);
+        /*
+         * Face-up installation: a left pivot must accumulate positive yaw,
+         * and a right pivot must accumulate negative yaw. Converting the
+         * expected direction to positive progress prevents a wrong-way pivot
+         * from falsely satisfying the angle threshold.
+         */
+        if (gCornerDirection == CORNER_LEFT) {
+            gCornerTurnAngle = gCornerSignedYawDelta;
+        } else {
+            gCornerTurnAngle = -gCornerSignedYawDelta;
+        }
+        if (gCornerTurnAngle >= CORNER_SLOW_ANGLE_DEGREES) {
+            pivotSpeed = CORNER_PIVOT_SLOW_SPEED;
+        }
+
         if (gCornerDirection == CORNER_LEFT) {
             commandChassisOrFault(
-                (int16_t) -CORNER_PIVOT_SPEED, CORNER_PIVOT_SPEED);
+                (int16_t) -pivotSpeed, pivotSpeed);
         } else {
             commandChassisOrFault(
-                CORNER_PIVOT_SPEED, (int16_t) -CORNER_PIVOT_SPEED);
+                pivotSpeed, (int16_t) -pivotSpeed);
         }
 
         gCornerPhaseCycles++;
@@ -713,7 +1037,8 @@ static void cornerControlStep(void)
             sCornerOldLineCleared = true;
             gCornerReacquireCycles = 0U;
         } else if (sCornerOldLineCleared &&
-                   (gCornerPhaseCycles >= CORNER_MIN_PIVOT_CYCLES)) {
+                   (gCornerTurnAngle >=
+                       CORNER_REACQUIRE_ANGLE_DEGREES)) {
             gCornerReacquireCycles++;
             if (gCornerReacquireCycles >= CORNER_REACQUIRE_CYCLES) {
                 gFollowState = FOLLOW_STATE_CORNER_SETTLE;
@@ -721,10 +1046,15 @@ static void cornerControlStep(void)
                 gLinePosition = sensedPosition;
                 gFilteredError = gLinePosition;
                 sLastValidError = gLinePosition;
+                sOfficialPatternIntegral = 0L;
+                gOfficialPatternIntegral = 0L;
                 pidReset(gLinePosition);
             }
         }
 
+        if (gCornerTurnAngle > CORNER_ABORT_ANGLE_DEGREES) {
+            stopAndLatchFault(FOLLOW_STATE_TURN_TIMEOUT, 5U, false);
+        }
         if (gCornerPhaseCycles > CORNER_TURN_TIMEOUT_CYCLES) {
             stopAndLatchFault(FOLLOW_STATE_TURN_TIMEOUT, 5U, false);
         }
@@ -737,7 +1067,7 @@ static void cornerControlStep(void)
      */
     if (!lineShapeValid) {
         gFollowState = FOLLOW_STATE_CORNER_PIVOT;
-        gCornerPhaseCycles = CORNER_MIN_PIVOT_CYCLES;
+        gCornerPhaseCycles = 0U;
         gCornerReacquireCycles = 0U;
         sCornerOldLineCleared = true;
         if (gCornerDirection == CORNER_LEFT) {
@@ -771,19 +1101,54 @@ static void cornerControlStep(void)
         gFollowState = FOLLOW_STATE_RUNNING;
         gCornerDirection = CORNER_NONE;
         gCornerPhaseCycles = 0U;
-        sTrackingCommandInitialized = false;
+        sCornerYawCaptured = false;
+        sOfficialPatternIntegral = 0L;
+        gOfficialPatternIntegral = 0L;
+        sFilteredGyroTargetRateDps = 0.0f;
+        gGyroTargetRateDps = 0.0f;
+        gGyroRateErrorDps = 0.0f;
+        gGyroAssistCorrection = 0;
         pidReset(sLastValidError);
         greenLed(true);
         blueLed(false);
     }
 }
 
+static void updateImuOrFault(void)
+{
+    if (IMU_MPU6050_update()) {
+        gImuRawFailureCycles = 0U;
+    } else {
+        gImuRawFailureCycles++;
+        if (gImuRawFailureCycles > IMU_RAW_FAILURE_LIMIT_CYCLES) {
+            /* Six short beeps: raw MPU6050 register/I2C reads failed. */
+            stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+        }
+    }
+
+    if (gImuYawFresh) {
+        gImuYawStaleCycles = 0U;
+    } else {
+        gImuYawStaleCycles++;
+        if (gImuYawStaleCycles > IMU_YAW_STALE_LIMIT_CYCLES) {
+            /*
+             * Seven short beeps: DMP produced no usable sample for too long.
+             * Eight short beeps identifies repeated DMP yaw jumps separately.
+             */
+            if (gImuLastDmpSampleStatus == IMU_DMP_SAMPLE_YAW_JUMP) {
+                stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 8U, false);
+            } else {
+                stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 7U, false);
+            }
+        }
+    }
+}
+
 static void lineFollowerStep(void)
 {
     CornerDirection cornerCandidate;
-    int16_t controlError;
-    int16_t baseSpeed;
 
+    updateImuOrFault();
     gGrayRaw = gray8ReadMajorityRaw();
     gBlackMask = rawToBlackMask(gGrayRaw);
     gActiveSensorCount = countSetBits(gBlackMask);
@@ -828,7 +1193,6 @@ static void lineFollowerStep(void)
         }
 
         if (gLostLineCycles >= LOST_PIVOT_AFTER_CYCLES) {
-            sTrackingCommandInitialized = false;
             if (sLastValidError <= 0) {
                 commandChassisOrFault(
                     (int16_t) -LOST_PIVOT_SPEED, LOST_PIVOT_SPEED);
@@ -839,9 +1203,6 @@ static void lineFollowerStep(void)
             gControlCycles++;
             return;
         }
-
-        controlError = sLastValidError;
-        baseSpeed = LOST_SEARCH_SPEED;
     } else if (gActiveSensorCount >= 6U) {
         gWideMarkCycles++;
         gLostLineCycles = 0U;
@@ -850,42 +1211,12 @@ static void lineFollowerStep(void)
         if (gWideMarkCycles > WIDE_MARK_LIMIT_CYCLES) {
             stopAndLatchFault(FOLLOW_STATE_WIDE_MARK_FAULT, 3U, false);
         }
-
-        controlError = sLastValidError;
-        baseSpeed = WIDE_MARK_SPEED;
     } else {
         gLostLineCycles = 0U;
         gWideMarkCycles = 0U;
-        gLinePosition =
-            blackMaskToPosition(gBlackMask, gActiveSensorCount);
-
-        /* Favor the newest sample so correction starts before a large drift. */
-        gFilteredError = (int16_t) (
-            ((int32_t) gFilteredError + (3L * gLinePosition)) / 4L);
-        controlError = gFilteredError;
-        sLastValidError = controlError;
-        baseSpeed = scheduledBaseSpeed(controlError);
     }
 
-    gPidCorrection = pidUpdate(controlError);
-    gLeftTarget =
-        clampTrackingWheelCommand((int32_t) baseSpeed + gPidCorrection);
-    gRightTarget =
-        clampTrackingWheelCommand((int32_t) baseSpeed - gPidCorrection);
-
-    if (!sTrackingCommandInitialized) {
-        sTrackingLeftCommand = gLeftTarget;
-        sTrackingRightCommand = gRightTarget;
-        sTrackingCommandInitialized = true;
-    } else {
-        sTrackingLeftCommand =
-            slewTrackingCommand(sTrackingLeftCommand, gLeftTarget);
-        sTrackingRightCommand =
-            slewTrackingCommand(sTrackingRightCommand, gRightTarget);
-    }
-
-    commandChassisOrFault(
-        sTrackingLeftCommand, sTrackingRightCommand);
+    LineWalking();
 
     gControlCycles++;
 }
@@ -925,10 +1256,19 @@ int main(void)
     }
 
     gFollowState = FOLLOW_STATE_ARMING;
+    blueLed(true);
+
+    /*
+     * Keep the vehicle motionless while MotionApps self-test and local gyro-Z
+     * zero-bias calibration run. Six short beeps report any IMU failure.
+     */
+    if (!IMU_MPU6050_init()) {
+        stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+    }
     blueLed(false);
 
     /* Two-second placement interval: keep the car on a normal line section. */
-    for (blink = 0U; blink < 4U; blink++) {
+    for (blink = 0U; blink < STARTUP_PLACEMENT_BLINKS; blink++) {
         greenLed(true);
         delay_cycles(DELAY_250_MS);
         greenLed(false);
@@ -956,13 +1296,33 @@ int main(void)
     sLastValidError = gLinePosition;
     sCornerCandidate = CORNER_NONE;
     gCornerDirection = CORNER_NONE;
+    sCornerYawCaptured = false;
     gCornerConfirmCycles = 0U;
     gCornerPhaseCycles = 0U;
     gCornerReacquireCycles = 0U;
-    gLeftTarget = BASE_SPEED;
-    gRightTarget = BASE_SPEED;
-    sTrackingCommandInitialized = false;
+    gLeftTarget = OFFICIAL_IRR_SPEED;
+    gRightTarget = OFFICIAL_IRR_SPEED;
+    sOfficialPatternError = 0;
+    sOfficialPreviousError = 0;
+    sOfficialPatternIntegral = 0L;
+    gOfficialPatternIntegral = 0L;
+    sOfficialTurnFlag = 0U;
+    sFilteredGyroTargetRateDps = 0.0f;
+    gGyroTargetRateDps = 0.0f;
+    gGyroRateErrorDps = 0.0f;
+    gGyroAssistCorrection = 0;
     pidReset(gLinePosition);
+
+    /*
+     * Calibration and placement delays can leave old DMP packets in FIFO.
+     * Flush them immediately before motion so the first corner uses current
+     * yaw rather than startup history.
+     */
+    if (!IMU_MPU6050_restartStream()) {
+        stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+    }
+    gImuRawFailureCycles = 0U;
+    gImuYawStaleCycles = 0U;
 
     gFollowState = FOLLOW_STATE_RUNNING;
     greenLed(true);
