@@ -1,9 +1,9 @@
 /*
- * Yahboom 8-channel black-line PID follower with MPU6050 feedback.
+ * Yahboom 8-channel black-line PID follower with IMU feedback.
  *
  * Safe behavior:
- *   - power-on/debugger resets command stop and wait
- *   - only a physical RST/NRST press arms the two-second start sequence
+ *   - power-on/debugger resets command stop and enter IMU initialization
+ *   - K1 starts, pauses, and resumes; K4 is an immediate emergency stop
  *   - I2C failure, sustained line loss, turn timeout, or sustained
  *     all-black input stops
  *   - confirmed 90-degree corners use forward compensation, pivot, and
@@ -13,6 +13,7 @@
  *   PA12 SCL, PA13 SDA (Yahboom motor driver, software I2C)
  *   PA14 OUT, PA15 AD0, PA16 AD1, PA17 AD2 (8-channel grayscale)
  *   PA1 SCL, PA0 SDA (MPU6050, software I2C; AD0 is wired to GND)
+ *   PA2 K1, PB19 K2, PB20 K3, PA23 K4 (active-low buttons)
  *   PB24 expansion-board buzzer (TIMA0 CCP3 PWM)
  */
 
@@ -55,6 +56,8 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define CORNER_SLOW_ANGLE_DEGREES       (72.0f)
 #define CORNER_REACQUIRE_ANGLE_DEGREES  (78.0f)
 #define CORNER_ABORT_ANGLE_DEGREES      (145.0f)
+#define CORNER_IMU_MAX_YAW_STEP_DEGREES (90.0f)
+#define NORMAL_IMU_MAX_YAW_STEP_DEGREES (30.0f)
 
 /*
  * Positive official pattern error makes the verified chassis turn right.
@@ -76,13 +79,16 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define GYRO_RATE_MAX_CORRECTION        ((int16_t) 70)
 #define IMU_RAW_FAILURE_LIMIT_CYCLES    (5U)
 #define IMU_YAW_STALE_LIMIT_CYCLES      (15U)
-#define STARTUP_PLACEMENT_BLINKS        (2U)
+#define IMU_WARMUP_TICKS                (400U)
 
 /*
  * Yahboom official LineWalking controller constants. V_z is converted to a
  * left/right speed delta using the official 188 mm chassis APB parameter.
  */
 #define OFFICIAL_IRR_SPEED          ((int16_t) 320)
+#define TRACKING_SPEED_MIN          ((int16_t) 240)
+#define TRACKING_SPEED_MAX          ((int16_t) 400)
+#define TRACKING_SPEED_STEP         ((int16_t) 20)
 #define OFFICIAL_CAR_APB            (188L)
 #define OFFICIAL_TURN_KP            (150L)
 #define OFFICIAL_TURN_KI            (4L)
@@ -118,19 +124,26 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define DELAY_250_MS       (CPUCLK_FREQ / 4U)
 #define DELAY_600_MS       ((CPUCLK_FREQ / 1000U) * 600U)
 #define CONTROL_LOOP_DELAY ((CPUCLK_FREQ / 1000U) * 15U)
+#define STATE_TICK_DELAY   DELAY_5_MS
 #define GRAY8_SETTLE_CYCLES ((CPUCLK_FREQ / 1000000U) * 100U)
+#define BUTTON_DEBOUNCE_TICKS (5U)
+#define CONTROL_TICKS_PER_STEP (3U)
 
 /* About 50 kHz with two delays in each software-I2C clock period. */
 #define SOFT_I2C_DELAY_CYCLES  (CPUCLK_FREQ / 100000U)
 #define SOFT_I2C_STRETCH_LIMIT (CPUCLK_FREQ / 1000U)
 
 typedef enum {
-    FOLLOW_STATE_WAITING_FOR_RST = 0,
-    FOLLOW_STATE_ARMING,
+    FOLLOW_STATE_BOOT_INIT = 0,
+    FOLLOW_STATE_IMU_WARMUP,
+    FOLLOW_STATE_IMU_CALIBRATING,
+    FOLLOW_STATE_READY,
     FOLLOW_STATE_RUNNING,
+    FOLLOW_STATE_PAUSED,
     FOLLOW_STATE_CORNER_APPROACH,
     FOLLOW_STATE_CORNER_PIVOT,
     FOLLOW_STATE_CORNER_SETTLE,
+    FOLLOW_STATE_EMERGENCY_STOP,
     FOLLOW_STATE_I2C_FAULT,
     FOLLOW_STATE_START_LINE_FAULT,
     FOLLOW_STATE_LINE_LOST,
@@ -144,6 +157,13 @@ typedef enum {
     CORNER_LEFT = -1,
     CORNER_RIGHT = 1
 } CornerDirection;
+
+typedef struct {
+    bool sampledPressed;
+    bool stablePressed;
+    bool pressedEvent;
+    uint8_t stableTicks;
+} ButtonDebounce;
 
 #if GRAY8_CHANNEL0_IS_LEFT
 #define LEFT_HALF_MASK   (0x0FU)
@@ -159,7 +179,6 @@ typedef enum {
 #define CENTER_SENSOR_MASK (0x18U)
 
 volatile DL_SYSCTL_RESET_CAUSE gResetCause;
-volatile bool gExternalResetDetected;
 volatile FollowState gFollowState;
 volatile CornerDirection gCornerDirection;
 volatile uint8_t gGrayRaw;
@@ -189,6 +208,12 @@ volatile float gGyroRateErrorDps;
 volatile int16_t gGyroAssistCorrection;
 volatile uint16_t gImuRawFailureCycles;
 volatile uint16_t gImuYawStaleCycles;
+volatile int16_t gTrackingBaseSpeed = OFFICIAL_IRR_SPEED;
+volatile uint16_t gImuWarmupTicks;
+volatile bool gK1Pressed;
+volatile bool gK2Pressed;
+volatile bool gK3Pressed;
+volatile bool gK4Pressed;
 
 static int16_t sPreviousError;
 static int16_t sLastValidError;
@@ -202,6 +227,10 @@ static CornerDirection sCornerCandidate;
 static bool sCornerOldLineCleared;
 static bool sCornerYawCaptured;
 static float sFilteredGyroTargetRateDps;
+static ButtonDebounce sK1;
+static ButtonDebounce sK2;
+static ButtonDebounce sK3;
+static ButtonDebounce sK4;
 
 static const int16_t sLineWeights[8] = {
     -350, -250, -150, -50, 50, 150, 250, 350
@@ -396,25 +425,74 @@ static bool stopAllMotorsTwice(void)
 
 static void ledsOff(void)
 {
-    DL_GPIO_setPins(GPIO_LEDS_PORT, ALL_STATUS_LEDS);
+    DL_GPIO_clearPins(GPIO_LEDS_PORT, ALL_STATUS_LEDS);
 }
 
 static void greenLed(bool on)
 {
     if (on) {
-        DL_GPIO_clearPins(GPIO_LEDS_PORT, GREEN_LED_PIN);
-    } else {
         DL_GPIO_setPins(GPIO_LEDS_PORT, GREEN_LED_PIN);
+    } else {
+        DL_GPIO_clearPins(GPIO_LEDS_PORT, GREEN_LED_PIN);
     }
 }
 
 static void blueLed(bool on)
 {
     if (on) {
-        DL_GPIO_clearPins(GPIO_LEDS_PORT, BLUE_LED_PIN);
-    } else {
         DL_GPIO_setPins(GPIO_LEDS_PORT, BLUE_LED_PIN);
+    } else {
+        DL_GPIO_clearPins(GPIO_LEDS_PORT, BLUE_LED_PIN);
     }
+}
+
+static void debounceButton(ButtonDebounce *button, bool pressed)
+{
+    if (pressed == button->sampledPressed) {
+        if (button->stableTicks < BUTTON_DEBOUNCE_TICKS) {
+            button->stableTicks++;
+        }
+    } else {
+        button->sampledPressed = pressed;
+        button->stableTicks = 1U;
+    }
+
+    if ((button->stableTicks >= BUTTON_DEBOUNCE_TICKS) &&
+        (button->stablePressed != button->sampledPressed)) {
+        button->stablePressed = button->sampledPressed;
+        if (button->stablePressed) {
+            button->pressedEvent = true;
+        }
+    }
+}
+
+static void updateButtons(void)
+{
+    gK1Pressed =
+        ((DL_GPIO_readPins(BUTTONS_A_PORT, BUTTONS_A_K1_PIN) &
+            BUTTONS_A_K1_PIN) == 0U);
+    gK4Pressed =
+        ((DL_GPIO_readPins(BUTTONS_A_PORT, BUTTONS_A_K4_PIN) &
+            BUTTONS_A_K4_PIN) == 0U);
+    gK2Pressed =
+        ((DL_GPIO_readPins(BUTTONS_B_PORT, BUTTONS_B_K2_PIN) &
+            BUTTONS_B_K2_PIN) == 0U);
+    gK3Pressed =
+        ((DL_GPIO_readPins(BUTTONS_B_PORT, BUTTONS_B_K3_PIN) &
+            BUTTONS_B_K3_PIN) == 0U);
+
+    debounceButton(&sK1, gK1Pressed);
+    debounceButton(&sK2, gK2Pressed);
+    debounceButton(&sK3, gK3Pressed);
+    debounceButton(&sK4, gK4Pressed);
+}
+
+static bool takePressedEvent(ButtonDebounce *button)
+{
+    bool event = button->pressedEvent;
+
+    button->pressedEvent = false;
+    return event;
 }
 
 static void buzzerOn(void)
@@ -616,12 +694,6 @@ static int16_t pidUpdate(int16_t error)
              ((PID_KD_NUM * sFilteredDerivative) / PID_KD_DEN);
     sPreviousError = error;
     return clampPidCorrection(output);
-}
-
-static bool wasExternalNrst(DL_SYSCTL_RESET_CAUSE resetCause)
-{
-    return (resetCause == DL_SYSCTL_RESET_CAUSE_BOOTRST_EXTERNAL_NRST) ||
-           (resetCause == DL_SYSCTL_RESET_CAUSE_POR_EXTERNAL_NRST);
 }
 
 static void stopAndLatchFault(FollowState fault, uint8_t beepCount, bool longBeeps)
@@ -933,11 +1005,12 @@ static void LineWalking(void)
         sLastValidError = gLinePosition;
     }
 
-    Motion_Car_Control(OFFICIAL_IRR_SPEED, 0, gPidCorrection);
+    Motion_Car_Control(gTrackingBaseSpeed, 0, gPidCorrection);
 }
 
 static void beginCorner(CornerDirection direction)
 {
+    IMU_MPU6050_setYawJumpLimit(CORNER_IMU_MAX_YAW_STEP_DEGREES);
     gCornerDirection = direction;
     gFollowState = FOLLOW_STATE_CORNER_APPROACH;
     gCornerPhaseCycles = 0U;
@@ -1099,6 +1172,7 @@ static void cornerControlStep(void)
     gCornerPhaseCycles++;
     if (gCornerPhaseCycles >= CORNER_SETTLE_CYCLES) {
         gFollowState = FOLLOW_STATE_RUNNING;
+        IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
         gCornerDirection = CORNER_NONE;
         gCornerPhaseCycles = 0U;
         sCornerYawCaptured = false;
@@ -1116,7 +1190,7 @@ static void cornerControlStep(void)
 
 static void updateImuOrFault(void)
 {
-    if (IMU_MPU6050_update()) {
+    if (IMU_MPU6050_update(false)) {
         gImuRawFailureCycles = 0U;
     } else {
         gImuRawFailureCycles++;
@@ -1221,16 +1295,163 @@ static void lineFollowerStep(void)
     gControlCycles++;
 }
 
-int main(void)
+static bool isMotionState(FollowState state)
+{
+    return (state == FOLLOW_STATE_RUNNING) ||
+           (state == FOLLOW_STATE_CORNER_APPROACH) ||
+           (state == FOLLOW_STATE_CORNER_PIVOT) ||
+           (state == FOLLOW_STATE_CORNER_SETTLE);
+}
+
+static void clearButtonEvents(void)
+{
+    sK1.pressedEvent = false;
+    sK2.pressedEvent = false;
+    sK3.pressedEvent = false;
+    sK4.pressedEvent = false;
+}
+
+static void resetTrackingController(
+    uint8_t initialRaw, uint8_t initialBlackMask, uint8_t initialBlackCount)
+{
+    gGrayRaw = initialRaw;
+    gBlackMask = initialBlackMask;
+    gActiveSensorCount = initialBlackCount;
+    gLinePosition =
+        blackMaskToPosition(initialBlackMask, initialBlackCount);
+    gFilteredError = gLinePosition;
+    sLastValidError = gLinePosition;
+    sCornerCandidate = CORNER_NONE;
+    gCornerDirection = CORNER_NONE;
+    sCornerYawCaptured = false;
+    gCornerConfirmCycles = 0U;
+    gCornerPhaseCycles = 0U;
+    gCornerReacquireCycles = 0U;
+    gLeftTarget = gTrackingBaseSpeed;
+    gRightTarget = gTrackingBaseSpeed;
+    gLeftCommand = 0;
+    gRightCommand = 0;
+    gLostLineCycles = 0U;
+    gWideMarkCycles = 0U;
+    sOfficialPatternError = 0;
+    sOfficialPreviousError = 0;
+    sOfficialPatternIntegral = 0L;
+    gOfficialPatternIntegral = 0L;
+    sOfficialTurnFlag = 0U;
+    sFilteredGyroTargetRateDps = 0.0f;
+    gGyroTargetRateDps = 0.0f;
+    gGyroRateErrorDps = 0.0f;
+    gGyroAssistCorrection = 0;
+    pidReset(gLinePosition);
+}
+
+static bool startTrackingFromCurrentLine(void)
 {
     uint8_t initialStableRaw;
     uint8_t initialBlackMask;
     uint8_t initialBlackCount;
-    uint8_t blink;
+
+    /*
+     * K1 start/resume always rechecks the physical line. This prevents a
+     * paused car that has been moved off-track from immediately driving.
+     */
+    initialStableRaw = gray8CaptureStableRaw();
+    gWhiteLevelIsHigh = (countSetBits(initialStableRaw) >= 4U);
+    initialBlackMask = rawToBlackMask(initialStableRaw);
+    initialBlackCount = countSetBits(initialBlackMask);
+    if ((initialBlackCount == 0U) || (initialBlackCount > 4U)) {
+        gFollowState = FOLLOW_STATE_READY;
+        gLeftCommand = 0;
+        gRightCommand = 0;
+        blueLed(true);
+        greenLed(false);
+        beepShort(4U);
+        return false;
+    }
+
+    resetTrackingController(
+        initialStableRaw, initialBlackMask, initialBlackCount);
+    IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
+    if (!IMU_MPU6050_restartStream()) {
+        stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+    }
+    gImuRawFailureCycles = 0U;
+    gImuYawStaleCycles = 0U;
+    gFollowState = FOLLOW_STATE_RUNNING;
+    blueLed(false);
+    greenLed(true);
+    beepShort(2U);
+    return true;
+}
+
+static void enterReadyState(void)
+{
+    IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
+    gFollowState = FOLLOW_STATE_READY;
+    gLeftCommand = 0;
+    gRightCommand = 0;
+    blueLed(true);
+    greenLed(false);
+    clearButtonEvents();
+}
+
+static void pauseTracking(void)
+{
+    IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
+    if (!stopAllMotorsTwice()) {
+        stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
+    }
+    gFollowState = FOLLOW_STATE_PAUSED;
+    gLeftCommand = 0;
+    gRightCommand = 0;
+    blueLed(true);
+    greenLed(true);
+    beepShort(1U);
+}
+
+static void emergencyStop(void)
+{
+    IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
+    if (!stopAllMotorsTwice()) {
+        stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
+    }
+    gFollowState = FOLLOW_STATE_EMERGENCY_STOP;
+    gLeftCommand = 0;
+    gRightCommand = 0;
+    ledsOff();
+    beepLong(1U);
+}
+
+static void adjustTrackingSpeed(int16_t delta)
+{
+    int32_t requested = (int32_t) gTrackingBaseSpeed + delta;
+
+    if (requested < TRACKING_SPEED_MIN) {
+        requested = TRACKING_SPEED_MIN;
+    } else if (requested > TRACKING_SPEED_MAX) {
+        requested = TRACKING_SPEED_MAX;
+    }
+    gTrackingBaseSpeed = (int16_t) requested;
+
+    if (delta < 0) {
+        beepShort(1U);
+    } else {
+        beepShort(2U);
+    }
+}
+
+int main(void)
+{
+    uint8_t controlTick = 0U;
+    uint8_t idleImuTick = 0U;
+    bool k1Event;
+    bool k2Event;
+    bool k3Event;
+    bool k4Event;
+    ImuCalibrationState calibrationState;
 
     /* Preserve the original cause before SysConfig initialization. */
     gResetCause = DL_SYSCTL_getResetCause();
-    gExternalResetDetected = wasExternalNrst(gResetCause);
 
     SYSCFG_DL_init();
     ledsOff();
@@ -1246,91 +1467,92 @@ int main(void)
         stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
     }
 
-    if (!gExternalResetDetected) {
-        gFollowState = FOLLOW_STATE_WAITING_FOR_RST;
-        greenLed(true);
-        beepShort(1U);
-        while (1) {
-            __WFI();
-        }
-    }
-
-    gFollowState = FOLLOW_STATE_ARMING;
+    gFollowState = FOLLOW_STATE_BOOT_INIT;
     blueLed(true);
-
-    /*
-     * Keep the vehicle motionless while MotionApps self-test and local gyro-Z
-     * zero-bias calibration run. Six short beeps report any IMU failure.
-     */
-    if (!IMU_MPU6050_init()) {
+    if (!IMU_MPU6050_prepare()) {
         stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
     }
-    blueLed(false);
-
-    /* Two-second placement interval: keep the car on a normal line section. */
-    for (blink = 0U; blink < STARTUP_PLACEMENT_BLINKS; blink++) {
-        greenLed(true);
-        delay_cycles(DELAY_250_MS);
-        greenLed(false);
-        delay_cycles(DELAY_250_MS);
-    }
-
-    /*
-     * With an 18 mm centered line, most sensors see white. Majority level
-     * therefore discovers whether this module reports white as high or low.
-     */
-    initialStableRaw = gray8CaptureStableRaw();
-    gWhiteLevelIsHigh = (countSetBits(initialStableRaw) >= 4U);
-    initialBlackMask = rawToBlackMask(initialStableRaw);
-    initialBlackCount = countSetBits(initialBlackMask);
-
-    if ((initialBlackCount == 0U) || (initialBlackCount > 4U)) {
-        stopAndLatchFault(FOLLOW_STATE_START_LINE_FAULT, 4U, false);
-    }
-
-    gGrayRaw = initialStableRaw;
-    gBlackMask = initialBlackMask;
-    gActiveSensorCount = initialBlackCount;
-    gLinePosition = blackMaskToPosition(initialBlackMask, initialBlackCount);
-    gFilteredError = gLinePosition;
-    sLastValidError = gLinePosition;
-    sCornerCandidate = CORNER_NONE;
-    gCornerDirection = CORNER_NONE;
-    sCornerYawCaptured = false;
-    gCornerConfirmCycles = 0U;
-    gCornerPhaseCycles = 0U;
-    gCornerReacquireCycles = 0U;
-    gLeftTarget = OFFICIAL_IRR_SPEED;
-    gRightTarget = OFFICIAL_IRR_SPEED;
-    sOfficialPatternError = 0;
-    sOfficialPreviousError = 0;
-    sOfficialPatternIntegral = 0L;
-    gOfficialPatternIntegral = 0L;
-    sOfficialTurnFlag = 0U;
-    sFilteredGyroTargetRateDps = 0.0f;
-    gGyroTargetRateDps = 0.0f;
-    gGyroRateErrorDps = 0.0f;
-    gGyroAssistCorrection = 0;
-    pidReset(gLinePosition);
-
-    /*
-     * Calibration and placement delays can leave old DMP packets in FIFO.
-     * Flush them immediately before motion so the first corner uses current
-     * yaw rather than startup history.
-     */
-    if (!IMU_MPU6050_restartStream()) {
-        stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
-    }
-    gImuRawFailureCycles = 0U;
-    gImuYawStaleCycles = 0U;
-
-    gFollowState = FOLLOW_STATE_RUNNING;
-    greenLed(true);
-    blueLed(false);
-    beepShort(2U);
+    gFollowState = FOLLOW_STATE_IMU_WARMUP;
+    gImuWarmupTicks = 0U;
 
     while (1) {
-        lineFollowerStep();
-        delay_cycles(CONTROL_LOOP_DELAY);
+        delay_cycles(STATE_TICK_DELAY);
+        updateButtons();
+        k1Event = takePressedEvent(&sK1);
+        k2Event = takePressedEvent(&sK2);
+        k3Event = takePressedEvent(&sK3);
+        k4Event = takePressedEvent(&sK4);
+
+        if (k4Event && (gFollowState != FOLLOW_STATE_EMERGENCY_STOP)) {
+            emergencyStop();
+            continue;
+        }
+
+        if (gFollowState == FOLLOW_STATE_EMERGENCY_STOP) {
+            if (k1Event && !gK4Pressed) {
+                enterReadyState();
+                beepShort(1U);
+            }
+            continue;
+        }
+
+        if (gFollowState == FOLLOW_STATE_IMU_WARMUP) {
+            gImuWarmupTicks++;
+            if (gImuWarmupTicks >= IMU_WARMUP_TICKS) {
+                IMU_MPU6050_startCalibration();
+                gFollowState = FOLLOW_STATE_IMU_CALIBRATING;
+            }
+            continue;
+        }
+
+        if (gFollowState == FOLLOW_STATE_IMU_CALIBRATING) {
+            calibrationState = IMU_MPU6050_calibrationStep();
+            if (calibrationState == IMU_CALIBRATION_FAILED) {
+                stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
+            }
+            if (calibrationState == IMU_CALIBRATION_COMPLETE) {
+                if (!IMU_MPU6050_finishCalibration()) {
+                    stopAndLatchFault(
+                        FOLLOW_STATE_IMU_FAULT, 6U, false);
+                }
+                enterReadyState();
+                beepShort(2U);
+            }
+            continue;
+        }
+
+        if ((gFollowState == FOLLOW_STATE_READY) ||
+            (gFollowState == FOLLOW_STATE_PAUSED)) {
+            idleImuTick++;
+            if (idleImuTick >= 4U) {
+                (void) IMU_MPU6050_update(true);
+                idleImuTick = 0U;
+            }
+
+            if (k2Event) {
+                adjustTrackingSpeed((int16_t) -TRACKING_SPEED_STEP);
+            }
+            if (k3Event) {
+                adjustTrackingSpeed(TRACKING_SPEED_STEP);
+            }
+            if (k1Event) {
+                (void) startTrackingFromCurrentLine();
+                controlTick = 0U;
+            }
+            continue;
+        }
+
+        if (isMotionState(gFollowState)) {
+            if (k1Event) {
+                pauseTracking();
+                controlTick = 0U;
+                continue;
+            }
+            controlTick++;
+            if (controlTick >= CONTROL_TICKS_PER_STEP) {
+                lineFollowerStep();
+                controlTick = 0U;
+            }
+        }
     }
 }

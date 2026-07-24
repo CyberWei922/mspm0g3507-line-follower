@@ -6,8 +6,8 @@
         </when>
     </applicability>
     <project
-        title="yahboom_black_line_pid_mpu6050"
-        name="yahboom_black_line_pid_mpu6050_LP_MSPM0G3507_nortos_ticlang"
+        title="yahboom_line_follower"
+        name="yahboom_line_follower_LP_MSPM0G3507_nortos_ticlang"
         configurations="Debug"
         toolChain="TICLANG"
         connection="TIXDS110_Connection.xml"
@@ -50,11 +50,11 @@
         description="Follow an 18 mm black tape line with grayscale pattern steering and MPU6050 angle feedback">
         <property name="buildProfile" value="release"/>
         <property name="isHybrid" value="true"/>
-        <file path="../yahboom_black_line_pid_mpu6050.c" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../yahboom_line_follower.c" openOnCreation="true" excludeFromBuild="false" action="copy" />
         <file path="../firmware_version.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
         <file path="../VERSION" openOnCreation="false" excludeFromBuild="false" action="copy" />
         <file path="../README.md" openOnCreation="false" excludeFromBuild="false" action="copy" />
-        <file path="../yahboom_black_line_pid_mpu6050.syscfg" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../yahboom_line_follower.syscfg" openOnCreation="true" excludeFromBuild="false" action="copy" />
         <file path="../mpu6050/imu_mpu6050.c" openOnCreation="false" excludeFromBuild="false" action="copy" />
         <file path="../mpu6050/imu_mpu6050.h" openOnCreation="false" excludeFromBuild="false" action="copy" />
         <file path="../mpu6050/bsp_mpu6050.c" openOnCreation="false" excludeFromBuild="false" action="copy" />

@@ -1,11 +1,11 @@
-# Yahboom 8-channel black-line PID follower + MPU6050
+# Yahboom 8-channel black-line PID line follower
 
 ## Firmware version
 
-- Version: `1.0.0`
-- Git tag: `mpu6050-v1.0.0`
-- Status: hardware-tested baseline before the button/state-machine and
-  revised MPU6050 calibration work
+- Version: `1.1.1-dev`
+- Git tag: `line-follower-v1.1.1-dev`
+- Status: local development build based on the published `mpu6050-v1.0.0`
+  baseline
 
 This project continues the Git history of `yahboom_black_line_pid` and adds the official
 `Competition_PJ/BSP/MPU6050` + MotionApps/DMP driver through a local wrapper.
@@ -24,6 +24,10 @@ This project continues the Git history of `yahboom_black_line_pid` and adds the 
 | MPU6050 SDA | PA0 |
 | MPU6050 AD0 | GND |
 | MPU6050 power | 3V3 and GND |
+| K1 | PA2 |
+| K2 | PB19 |
+| K3 | PB20 |
+| K4 | PA23 |
 | Expansion-board buzzer | PB24 / TIMA0 CCP3 |
 
 MPU6050 `INT`, `XDA`, and `XCL` remain disconnected. The actual installation
@@ -38,19 +42,20 @@ Use the same wiring that passed the grayscale/buzzer validation. During
 runtime testing, power the car from its battery and avoid parallel USB power
 paths through the core board or motor driver.
 
-## Safe start sequence
+## Button state machine and safe start sequence
 
 1. Programming, debugger reset, and power-on always command zero motor speed.
-2. One short beep means the program is idle and waiting for the physical RST
-   button.
-3. Put the sensor over a normal section of the 18 mm black tape, with the line
-   roughly centered, then press the physical RST button.
-4. Keep the entire car motionless while the blue LED is on. The program checks
-   address `0x68`, initializes DMP, runs self-test, and calibrates gyro-Z bias.
-5. The green LED flashes for two seconds while the car remains stopped.
-6. Two short beeps mean the line and current DMP yaw were recognized.
-7. The car follows using differential steering. The experimental official
-   pattern-table base speed is 320.
+2. The blue LED stays on while the MPU6050 is initialized, then the vehicle
+   remains still for a 2-second warm-up and 400 stationary gyro-Z samples.
+3. Two short beeps and a blue LED mean `READY`. Place the sensor over a normal
+   section of the 18 mm black tape before pressing K1.
+4. K1 starts or resumes tracking. K1 during motion pauses immediately and
+   commands zero speed; K1 from `PAUSED` rechecks the line and resumes.
+5. K2 lowers the base speed and K3 raises it, in 20-step increments while
+   `READY` or `PAUSED`. The allowed range is 240..400.
+6. K4 is an emergency stop. After it is released, K1 clears the stop and
+   returns to `READY`.
+7. The car follows using differential steering. The default base speed is 320.
 
 ## Experimental official LineWalking adaptation
 
@@ -64,7 +69,8 @@ Yahboom `Competition_PJ/BSP/Eight_Tracking` implementation:
   `-3, -2, -1, 0, 1, 2, 3`, with `-15/+15` for sharp turns;
 - unlisted patterns retain the previous error, reproducing the reference
   controller's direction memory;
-- normal pattern-table PID uses Kp=150, Ki=4, Kd=0.5 and base speed 320;
+- normal pattern-table PID uses Kp=150, Ki=4, Kd=0.5 and the adjustable base
+  speed (default 320);
 - the bounded grayscale-error integral handles persistent -1/+1 offsets that
   a yaw-rate-only controller cannot remove; it decays around the center and
   resets for sharp turns;
@@ -115,8 +121,9 @@ All motion faults send two zero-speed commands before sounding the buzzer.
 
 ## Initial control settings
 
-- Approximate control period: 20 ms
-- Official pattern-table base speed: 320
+- Approximate control period: 15 ms (5 ms state tick, one control update every
+  three ticks)
+- Official pattern-table base speed: 320 (adjustable 240..400 with K2/K3)
 - Official normal PID: Kp = 150, Ki = 4, Kd = 0.5
 - Bounded grayscale-error integral: -80 to +80
 - Official small pattern error range: -3 to +3
@@ -130,8 +137,14 @@ All motion faults send two zero-speed commands before sounding the buzzer.
 - Maximum allowed corner angle: 145 degrees
 - Post-turn PID settling: about 160 ms at speed 230
 - MPU6050 DMP output: 50 Hz
-- MPU6050 DLPF: 20 Hz through the official sample-rate configuration
-- Gyro-Z startup calibration: 120 stationary samples after 20 discarded samples
+- MPU6050 DLPF: explicitly restored and verified at 42 Hz after DMP setup
+- MPU6050 yaw jump limit: 30° during normal tracking, temporarily 90° while
+  inside the corner approach/pivot/settle state, then restored to 30°
+- Gyro-Z startup calibration: 400 stationary samples after a 2-second warm-up
+- Gyro-Z rate filter: scalar 1-D Kalman update; this reduces rate noise but
+  does not create an absolute yaw reference
+- Stationary zero-rate update: after about 0.5 seconds below 0.8 dps, bias
+  adapts slowly and DMP yaw deltas are held rather than accumulated
 
 The verified motor order is:
 
