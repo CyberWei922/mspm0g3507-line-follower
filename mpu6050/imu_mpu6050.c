@@ -16,12 +16,14 @@
 #define IMU_CALIBRATION_MAX_SPAN_DPS (5.0f)
 #define IMU_FIRST_DMP_ATTEMPTS       (30U)
 #define IMU_DEFAULT_MAX_YAW_STEP_DEGREES (30.0f)
+#define IMU_CORNER_REANCHOR_STEP_DEGREES (45.0f)
 #define IMU_GYRO_DEADBAND_DPS        (0.30f)
 #define IMU_RATE_KALMAN_Q            (0.04f)
 #define IMU_RATE_KALMAN_R            (1.50f)
 #define IMU_STATIONARY_RATE_LIMIT_DPS (0.80f)
 #define IMU_STATIONARY_MIN_SAMPLES   (25U)
 #define IMU_BIAS_ADAPT_WEIGHT        (0.002f)
+#define IMU_UPDATE_PERIOD_SECONDS    (0.015f)
 
 volatile ImuMpu6050Status gImuStatus = IMU_MPU6050_ID_READ_FAILED;
 volatile ImuDmpSampleStatus gImuLastDmpSampleStatus =
@@ -34,6 +36,7 @@ volatile float gImuYawDegrees = 0.0f;
 volatile float gImuYawUnwrappedDegrees = 0.0f;
 volatile float gImuGyroZDps = 0.0f;
 volatile float gImuGyroZBiasDps = 0.0f;
+volatile float gImuRelativeGyroAngleDegrees = 0.0f;
 volatile float gImuGyroZCalibrationSpanDps = 0.0f;
 volatile float gImuYawScaleFactor = 1.0f;
 volatile float gImuRateKalmanGain = 0.0f;
@@ -42,6 +45,7 @@ volatile uint16_t gImuDLPFHz = 0U;
 volatile uint32_t gImuRawReadErrors = 0U;
 volatile uint32_t gImuDmpReadMisses = 0U;
 volatile uint32_t gImuRejectedYawJumps = 0U;
+volatile uint32_t gImuCornerYawReanchors = 0U;
 
 static float sGyroSensitivity = 16.4f;
 static float sPreviousYaw;
@@ -56,6 +60,7 @@ static float sKalmanRateEstimate;
 static float sKalmanRateCovariance = 1.0f;
 static uint16_t sStationarySamples;
 static float sMaxYawStepDegrees = IMU_DEFAULT_MAX_YAW_STEP_DEGREES;
+static bool sCornerMode;
 
 static float absoluteFloat(float value)
 {
@@ -146,8 +151,32 @@ static bool updateDmpYaw(bool stationaryLocked)
     {
         float delta = wrapYawDelta(yaw - sPreviousYaw);
 
+        if (sCornerMode &&
+            (absoluteFloat(delta) >
+                IMU_CORNER_REANCHOR_STEP_DEGREES)) {
+            /*
+             * A real 50 Hz corner sample is far below 45 degrees. Larger
+             * deltas indicate a delayed/discontinuous DMP packet: re-anchor
+             * wrapped yaw and let raw gyro integration retain turn progress.
+             */
+            gImuRejectedYawJumps++;
+            sPreviousYaw = yaw;
+            gImuYawDegrees = yaw;
+            gImuYawFresh = true;
+            gImuLastDmpSampleStatus = IMU_DMP_SAMPLE_REANCHORED;
+            gImuCornerYawReanchors++;
+            return true;
+        }
         if (absoluteFloat(delta) > sMaxYawStepDegrees) {
             gImuRejectedYawJumps++;
+            /*
+             * Reject the discontinuity, but move the wrapped reference to
+             * the newest packet. Without this re-anchor, every later packet
+             * is compared with the same obsolete yaw and one glitch turns
+             * into a permanent stream of rejected samples and eight beeps.
+             */
+            sPreviousYaw = yaw;
+            gImuYawDegrees = yaw;
             gImuLastDmpSampleStatus = IMU_DMP_SAMPLE_YAW_JUMP;
             return false;
         }
@@ -181,10 +210,13 @@ bool IMU_MPU6050_prepare(void)
     gImuRawReadErrors = 0U;
     gImuDmpReadMisses = 0U;
     gImuRejectedYawJumps = 0U;
+    gImuCornerYawReanchors = 0U;
     gImuCalibrationSamples = 0U;
     gImuGyroZCalibrationSpanDps = 0.0f;
     gImuDLPFHz = 0U;
+    gImuRelativeGyroAngleDegrees = 0.0f;
     sMaxYawStepDegrees = IMU_DEFAULT_MAX_YAW_STEP_DEGREES;
+    sCornerMode = false;
     sCalibrationState = IMU_CALIBRATION_IDLE;
     resetRateFilter();
 
@@ -321,6 +353,7 @@ bool IMU_MPU6050_restartStream(void)
 
     gImuYawValid = false;
     gImuYawFresh = false;
+    sCornerMode = false;
     if (mpu_reset_fifo() != 0) {
         gImuStatus = IMU_MPU6050_DMP_INIT_FAILED;
         return false;
@@ -336,6 +369,11 @@ bool IMU_MPU6050_restartStream(void)
 
     gImuStatus = IMU_MPU6050_NO_DMP_DATA;
     return false;
+}
+
+void IMU_MPU6050_setCornerMode(bool enabled)
+{
+    sCornerMode = enabled;
 }
 
 void IMU_MPU6050_setYawJumpLimit(float maxStepDegrees)
@@ -397,6 +435,8 @@ bool IMU_MPU6050_update(bool stationary)
         (1.0f - kalmanGain) * sKalmanRateCovariance;
     gImuRateKalmanGain = kalmanGain;
     gImuGyroZDps = sKalmanRateEstimate;
+    gImuRelativeGyroAngleDegrees +=
+        gImuGyroZDps * IMU_UPDATE_PERIOD_SECONDS * gImuYawScaleFactor;
 
     if (stationary &&
         (absoluteFloat(correctedRate) < IMU_STATIONARY_RATE_LIMIT_DPS)) {
@@ -425,6 +465,16 @@ void IMU_MPU6050_setYawScaleFactor(float scaleFactor)
     if ((scaleFactor >= 0.50f) && (scaleFactor <= 1.50f)) {
         gImuYawScaleFactor = scaleFactor;
     }
+}
+
+void IMU_MPU6050_resetRelativeGyroAngle(void)
+{
+    gImuRelativeGyroAngleDegrees = 0.0f;
+}
+
+float IMU_MPU6050_signedRelativeGyroAngle(void)
+{
+    return gImuRelativeGyroAngleDegrees;
 }
 
 float IMU_MPU6050_relativeAngle(float startYawUnwrapped)

@@ -1,196 +1,176 @@
-# Yahboom 8-channel black-line PID line follower
+# 亚博智能八路灰度 PID 巡线小车
 
-## Firmware version
+## 固件版本
 
-- Version: `1.1.1-dev`
-- Git tag: `line-follower-v1.1.1-dev`
-- Status: local development build based on the published `mpu6050-v1.0.0`
-  baseline
+- 版本：`1.2.0-dev`
+- Git 标签：`line-follower-v1.2.0-dev`
+- 基线版本：`line-follower-v1.1.1-dev`
+- 实车状态：直线与普通弯道可运行；直角弯存在转速过高、越过新黑线后继续旋转的问题。本版本只用于保留问题现场，不作为稳定比赛版。
 
-This project continues the Git history of `yahboom_black_line_pid` and adds the official
-`Competition_PJ/BSP/MPU6050` + MotionApps/DMP driver through a local wrapper.
+本工程使用 MSPM0G3507、亚博智能四路电机驱动、八路数字灰度传感器和 MPU6050。MPU6050 驱动来自官方 `Competition_PJ/BSP/MPU6050` 与 MotionApps/DMP，并通过本工程的适配层调用。
 
-## Wiring
+## 完整接线
 
-| Function | MSPM0G3507 |
-| --- | --- |
-| Motor SCL | PA12 |
-| Motor SDA | PA13 |
-| Grayscale OUT | PA14 |
-| Grayscale AD0 | PA15 |
-| Grayscale AD1 | PA16 |
-| Grayscale AD2 | PA17 |
-| MPU6050 SCL | PA1 |
-| MPU6050 SDA | PA0 |
-| MPU6050 AD0 | GND |
-| MPU6050 power | 3V3 and GND |
-| K1 | PA2 |
-| K2 | PB19 |
-| K3 | PB20 |
-| K4 | PA23 |
-| Expansion-board buzzer | PB24 / TIMA0 CCP3 |
+### 电机驱动板与四个电机
 
-MPU6050 `INT`, `XDA`, and `XCL` remain disconnected. The actual installation
-used by this build is component-side up, with the vehicle nose pointing toward
-the left side of the supplied module photograph. In that photograph sensor
-`+X` points right and `+Y` points up, so sensor `+X` is vehicle rear, sensor
-`+Y` is vehicle right, and sensor `+Z` points upward. The copied DMP
-orientation matrix therefore applies a 180-degree rotation around Z. Vehicle
-left yaw is positive and vehicle right yaw is negative.
-
-Use the same wiring that passed the grayscale/buzzer validation. During
-runtime testing, power the car from its battery and avoid parallel USB power
-paths through the core board or motor driver.
-
-## Button state machine and safe start sequence
-
-1. Programming, debugger reset, and power-on always command zero motor speed.
-2. The blue LED stays on while the MPU6050 is initialized, then the vehicle
-   remains still for a 2-second warm-up and 400 stationary gyro-Z samples.
-3. Two short beeps and a blue LED mean `READY`. Place the sensor over a normal
-   section of the 18 mm black tape before pressing K1.
-4. K1 starts or resumes tracking. K1 during motion pauses immediately and
-   commands zero speed; K1 from `PAUSED` rechecks the line and resumes.
-5. K2 lowers the base speed and K3 raises it, in 20-step increments while
-   `READY` or `PAUSED`. The allowed range is 240..400.
-6. K4 is an emergency stop. After it is released, K1 clears the stop and
-   returns to `READY`.
-7. The car follows using differential steering. The default base speed is 320.
-
-## Experimental official LineWalking adaptation
-
-Normal tracking is currently a local, uncommitted experiment adapted from the
-Yahboom `Competition_PJ/BSP/Eight_Tracking` implementation:
-
-- each of the eight digital sensors uses a three-scan majority vote;
-- the local `OUT + AD0/AD1/AD2` scan is converted into the official
-  `x1` through `x8` convention, where zero means black;
-- the official priority table maps recognized patterns to errors
-  `-3, -2, -1, 0, 1, 2, 3`, with `-15/+15` for sharp turns;
-- unlisted patterns retain the previous error, reproducing the reference
-  controller's direction memory;
-- normal pattern-table PID uses Kp=150, Ki=4, Kd=0.5 and the adjustable base
-  speed (default 320);
-- the bounded grayscale-error integral handles persistent -1/+1 offsets that
-  a yaw-rate-only controller cannot remove; it decays around the center and
-  resets for sharp turns;
-- the official `Motion_Car_Control(V_x, 0, V_z)` geometry conversion is kept,
-  but its output is routed through the verified local motor signs and PA12/PA13
-  software-I2C driver;
-- the reference bug that never updated `error_last` is corrected.
-
-A confirmed right-angle pattern enters this non-blocking state sequence:
-
-1. The same left/right corner must be detected for two consecutive loops.
-2. Both sides drive at speed 210 for eight loops (about 160 ms). This moves the
-   wheel rotation center toward the corner instead of pivoting as soon as the
-   front sensor bar sees it.
-3. At the end of forward compensation, the current unwrapped DMP yaw is saved
-   as the corner start angle.
-4. The chassis pivots in place at speed 330. At 72 degrees it reduces pivot
-   speed to 270 so the motors retain torque against cloth friction.
-5. The old center line must first disappear. After at least 78 degrees, a
-   valid 1-to-3-sensor line must remain within 75 position units of center for
-   four consecutive loops.
-6. More than 145 degrees without reacquisition stops the car. The time-based
-   timeout is extended to 120 control cycles as a second guard.
-7. The car uses reduced-correction PID at speed 180 for eight loops (about
-   160 ms), resets PID history, and resumes normal tracking. If the line
-   disappears during this phase, it returns to pivot/reacquisition.
-
-Normal `-3..+3` patterns also receive a limited gyro-Z rate correction. The
-requested yaw rate is filtered before use, and the measured-minus-requested
-rate error supplies true negative feedback for the verified motor steering
-sign. Centered-line damping is stronger than turning damping, reducing
-left-right hunting without preventing the optical controller from entering a
-curve. The official pattern-table result stays primary; the IMU contribution
-is clamped to avoid fighting sharp-turn handling.
-
-## Fault sounds
-
-| Sound | Meaning |
-| --- | --- |
-| 3 long beeps | Motor driver did not acknowledge I2C |
-| 4 short beeps | No valid 1-to-4-sensor line was present at startup |
-| 2 long beeps | Line was lost for about 0.8 seconds |
-| 3 short beeps | Six or more sensors stayed black for about 0.5 seconds |
-| 5 short beeps | Corner pivot did not reacquire the line in about 1.6 seconds |
-| 6 short beeps | MPU6050 ID, DMP, gyro read, or yaw stream failure |
-
-All motion faults send two zero-speed commands before sounding the buzzer.
-
-## Initial control settings
-
-- Approximate control period: 15 ms (5 ms state tick, one control update every
-  three ticks)
-- Official pattern-table base speed: 320 (adjustable 240..400 with K2/K3)
-- Official normal PID: Kp = 150, Ki = 4, Kd = 0.5
-- Bounded grayscale-error integral: -80 to +80
-- Official small pattern error range: -3 to +3
-- Official sharp-turn error: -15 or +15
-- Official `Motion_Car_Control` APB parameter: 188
-- Pattern-controller signed wheel limit: -500 to +500
-- Corner-settling PID: Kp = 0.60, Ki = 0, Kd = 0.55
-- Right-angle forward compensation: about 160 ms at speed 210
-- Right-angle pivot speed: 330, reduced to 270 after 72 degrees
-- New-line acceptance begins at 78 degrees
-- Maximum allowed corner angle: 145 degrees
-- Post-turn PID settling: about 160 ms at speed 230
-- MPU6050 DMP output: 50 Hz
-- MPU6050 DLPF: explicitly restored and verified at 42 Hz after DMP setup
-- MPU6050 yaw jump limit: 30° during normal tracking, temporarily 90° while
-  inside the corner approach/pivot/settle state, then restored to 30°
-- Gyro-Z startup calibration: 400 stationary samples after a 2-second warm-up
-- Gyro-Z rate filter: scalar 1-D Kalman update; this reduces rate noise but
-  does not create an absolute yaw reference
-- Stationary zero-rate update: after about 0.5 seconds below 0.8 dps, bias
-  adapts slowly and DMP yaw deltas are held rather than accumulated
-
-The verified motor order is:
-
-| Driver channel | Wheel | Forward command sign |
+| 电机驱动端子 | 接到哪里 | 说明 |
 | --- | --- | --- |
-| M1 | Left front | Positive |
-| M2 | Right front | Negative |
-| M3 | Left rear | Negative |
-| M4 | Right rear | Positive |
+| M1 | 左前轮电机 | 前进时发送正速度 |
+| M2 | 右前轮电机 | 前进时发送负速度 |
+| M3 | 左后轮电机 | 前进时发送负速度 |
+| M4 | 右后轮电机 | 前进时发送正速度 |
+| SCL | MSPM0G3507 PA12 | 软件 I2C 时钟 |
+| SDA | MSPM0G3507 PA13 | 软件 I2C 数据 |
+| GND | 扩展板 GND | 必须与 MSPM0G3507 共地 |
+| 5V | 扩展板 IIC 接口的 5V | 只沿用已经验证的整车供电路径 |
+| 电机电源输入 | 扩展板 OUT | 扩展板由 12V 电池供电 |
 
-Left/right differential steering therefore groups M1 with M3 and M2 with M4.
+左右差速分组必须是：左侧 M1、M3；右侧 M2、M4。不能按前后轮分组。
 
-The integral path and anti-windup are implemented, but Ki starts at zero for
-safe first tuning. PID constants are grouped at the top of the C source.
+### 八路灰度传感器
 
-For first right-angle tuning, change only one setting at a time:
+| 灰度模块引脚 | 接到 MSPM0G3507 | 作用 |
+| --- | --- | --- |
+| OUT | PA14 | 当前被选中通道的数字检测结果 |
+| AD0 | PA15 | 八选一通道地址最低位 |
+| AD1 | PA16 | 八选一通道地址中间位 |
+| AD2 | PA17 | 八选一通道地址最高位 |
+| VCC | 扩展板原配灰度接口电源 | 保持已经通过蜂鸣器测试程序验证的接法 |
+| GND | 扩展板 GND | 必须与 MSPM0G3507 共地 |
 
-1. If the rotation slows too early or too late, adjust
-   `CORNER_SLOW_ANGLE_DEGREES`.
-2. If the car reaches the corner too early or late before starting rotation,
-   adjust `CORNER_APPROACH_CYCLES`.
-3. If it stops before the sensor reaches the new line, adjust
-   `CORNER_REACQUIRE_ANGLE_DEGREES` only after checking actual logged yaw.
-4. If it cannot rotate against floor friction or overshoots badly, adjust
-   `CORNER_PIVOT_SPEED` and `CORNER_PIVOT_SLOW_SPEED` in steps of 10.
-5. Only after angle handling is stable should gyro-rate feedback or line-PD
-   gains be changed.
+程序依次设置 AD0、AD1、AD2，读取 OUT，从而获得 8 个数字灰度探头的状态。当前把通道 0 当成车体左侧；正常压住 18 mm 黑线时，目标状态是中间两路同时检测到黑色。
 
-## First hardware validation
+### MPU6050
 
-Before placing the car on the floor:
+| MPU6050 引脚 | 接到 MSPM0G3507 | 作用 |
+| --- | --- | --- |
+| VCC | 3V3 | 本工程按 3.3V 逻辑使用 |
+| GND | GND | 与主控、灰度和电机驱动共地 |
+| SCL | PA1 | MPU6050 软件 I2C 时钟 |
+| SDA | PA0 | MPU6050 软件 I2C 数据 |
+| AD0 | GND | I2C 地址固定为 `0x68` |
+| INT | 不接 | 当前程序轮询读取，不使用中断脚 |
+| XDA | 不接 | 辅助 I2C 数据脚未使用 |
+| XCL | 不接 | 辅助 I2C 时钟脚未使用 |
 
-1. Raise all wheels and keep the module motionless during initialization.
-2. Confirm there are two short start beeps, not six fault beeps.
-3. This build assumes the confirmed component-side-up installation with the
-   vehicle nose toward the photograph's left side.
-4. During the first raised-wheel run, verify that a detected left corner makes
-   the chassis pivot left and a detected right corner makes it pivot right.
-5. If the first floor run amplifies left-right oscillation instead of damping
-   it, stop immediately; do not keep running at speed. The installation
-   assumption or a gyro sign must be corrected before the next test.
+安装方向：MPU6050 元件面朝上，车头指向用户所发模块照片的左侧。此时传感器 `+X` 指向车尾，`+Y` 指向车体右侧，`+Z` 指向上方。程序中的 DMP 方向矩阵已按该安装方式转换：左转为正角度，右转为负角度。
 
-The build uses a 2 KB stack because the official DMP quaternion conversion has
-substantially more local state than the original follower.
+### 扩展板按键、蜂鸣器与指示灯
 
-Channel 0 is initially treated as the physical left side. If the first
-raised-wheel test proves that steering correction is reversed, change
-`GRAY8_CHANNEL0_IS_LEFT` from `1U` to `0U`, rebuild, and retest. Do not test
-this for the first time at full speed on the floor.
+| 板上器件 | MSPM0G3507 引脚 | 当前功能 |
+| --- | --- | --- |
+| K1 | PA2 | 启动、暂停、恢复；按下为低电平 |
+| K2 | PB19 | 基础速度降低 20；按下为低电平 |
+| K3 | PB20 | 基础速度提高 20；按下为低电平 |
+| K4 | PA23 | 紧急停车；按下为低电平 |
+| 蜂鸣器 | PB24 / TIMA0 CCP3 | 约 3.1 kHz PWM |
+| 蓝色 LED | PB2 | 高电平点亮 |
+| 绿色 LED | PB3 | 高电平点亮 |
+
+### DAPLink 烧录器
+
+| DAPLink | 核心板 | 说明 |
+| --- | --- | --- |
+| SWD | PA19 / SWDIO | 调试数据，不能接到 PA20 |
+| CLK | PA20 / SWCLK | 调试时钟，不能接到 PA19 |
+| GND | GND | 必须共地 |
+| RST | RST | 推荐接入，便于复位下连接 |
+| 3V3 | 核心板 3V3 | 仅作目标参考或核心板小电流供电，不能给电机系统供电 |
+
+整车使用 12V 电池运行时，避免同时从核心板 Type-C、电机驱动 Type-C、扩展板 OUT 或 IIC 5V 建立多个并行供电路径。烧录和架空测试时先确认实际供电路径，所有车轮必须离地。
+
+## 按键状态机与安全启动
+
+1. 上电、复位和烧录完成后，程序先发送两次零速命令。
+2. 蓝灯点亮时，MPU6050 先预热 2 秒，然后在车辆静止状态下采集 400 个陀螺仪零偏样本。
+3. 两声短鸣且蓝灯保持点亮表示进入待启动状态。按 K1 前，应让八路灰度位于正常黑线上。
+4. K1 启动或恢复循迹；运行中按 K1 立即停车并进入暂停状态。
+5. 待启动或暂停时，K2 降速、K3 加速，每次改变 20，范围为 240～400。
+6. K4 在任何运行阶段执行紧急停车。松开 K4 后按 K1 回到待启动状态。
+7. 默认直线基础速度为 320。
+
+## 正常巡线算法
+
+正常巡线部分借鉴亚博智能 `Competition_PJ/BSP/Eight_Tracking`：
+
+- 每个数字灰度通道连续扫描三次并做多数表决，过滤单次反光或噪声；
+- 将 `OUT + AD0/AD1/AD2` 的扫描结果转换为官方 `x1`～`x8` 格式，其中 0 表示黑色；
+- 官方优先级表把常见线型映射为 `-3、-2、-1、0、1、2、3`，急转模式为 `-15/+15`；
+- 没有列出的线型保留上一次方向误差；
+- 正常 PID 参数为 Kp=190、Ki=5、Kd=0.5；
+- 中间两路同时检测到黑色才是直线居中目标；
+- 单个中间探头长期偏离时加快误差积分，回到中间两路后保留已经学到的机械偏差补偿；
+- 使用已经实车确认的 M1～M4 符号，通过 PA12、PA13 软件 I2C 发送电机命令；
+- 修正了官方参考代码没有更新上次误差的问题；
+- MPU6050 角速度只用于限制蛇形摆动，八路灰度仍然是决定左右位置的主要传感器。
+
+## 本版本的直角弯流程
+
+1. 相同方向的直角特征连续出现两次后确认弯道。
+2. 左右轮以 260 的速度向前运行 8 个控制周期，补偿灰度传感器到车体旋转中心的距离。
+3. 保存此时的 DMP 航向角，并清零短期原始陀螺仪积分角度。
+4. 原地旋转速度为 400；角度达到 72° 后降到 340。
+5. 旧直线消失、转角至少达到 78°且中间两路连续 4 个控制周期检测到黑线后，进入转弯收尾。
+6. 转角超过 145°或旋转超过 120 个控制周期仍未重新捕获黑线，停车并短鸣 5 声。
+7. 捕获成功后以 280 的速度执行 8 个周期的小幅 PID 修正，然后恢复正常巡线。
+
+### 已确认的直角弯缺陷
+
+实车已经确认该方案不可继续作为比赛参数使用：
+
+- 400/340 的原地旋转速度过高；
+- 两颗中央探头必须连续命中 4 次的条件过严，高速旋转时可能只扫到一两个周期；
+- 一旦越过新黑线，程序仍会继续同方向旋转，直到 145°或超时保护；
+- 如果角度正负方向或短期积分异常，角度保护可能不能及时反映真实旋转量。
+
+下一版必须降低后半段旋转速度、在接近 90°时主动制动，并增加与方向正负无关的绝对角度保险，防止持续转圈。
+
+## 蜂鸣器含义
+
+短鸣约 60 ms，长鸣约 600 ms。
+
+| 声音 | 含义 |
+| --- | --- |
+| 2 声短鸣 | MPU6050 校准完成，或 K1 成功启动/恢复 |
+| 1 声短鸣 | K1 暂停、K2 降速，或解除紧急停车 |
+| 2 声短鸣 | K3 加速 |
+| 1 声长鸣 | K4 紧急停车 |
+| 2 声长鸣 | 黑线丢失且搜索超时 |
+| 3 声长鸣 | 电机驱动板 I2C 无应答 |
+| 3 声短鸣 | 6 路及以上探头持续检测到黑色 |
+| 4 声短鸣 | K1 启动时没有检测到有效的 1～4 路黑线 |
+| 5 声短鸣 | 直角弯没有在规定角度或时间内重新找到黑线 |
+| 6 声短鸣 | MPU6050 初始化、ID 或原始陀螺仪读取失败 |
+| 7 声短鸣 | DMP 长时间没有产生可用姿态数据 |
+| 8 声短鸣 | DMP 连续出现异常的大角度跳变 |
+
+所有运动故障都会先发送两次零速命令，再鸣叫并锁定。
+
+## 当前主要参数
+
+- 名义控制周期：约 15 ms；实际还包含 I2C、灰度扫描和 DMP 读取耗时
+- 默认巡线速度：320，可用 K2/K3 在 240～400 调整
+- 正常 PID：Kp=190、Ki=5、Kd=0.5
+- 灰度误差积分范围：-100～+100
+- 直角向前补偿：速度 260，共 8 个控制周期
+- 直角原地旋转：速度 400；72°后降到 340
+- 新黑线允许捕获角：78°
+- 直角最大允许角：145°
+- 转弯收尾：速度 280，共 8 个控制周期
+- MPU6050 DMP 输出频率：50 Hz
+- MPU6050 数字低通带宽：42 Hz
+- 正常 DMP 单步角度限制：30°
+- 直角状态下，单次 DMP 变化超过 45°时重新建立参考，同时保留 150°安全上限
+- 陀螺仪零偏：上电预热 2 秒后采集 400 个静止样本
+- 陀螺仪角速度：使用一维标量卡尔曼滤波
+
+## 首次实车验证要求
+
+1. 烧录后先架空四个车轮。
+2. 初始化期间保持车辆和 MPU6050 完全静止。
+3. 确认校准结束是两声短鸣，而不是 6、7 或 8 声故障音。
+4. 架空触发左、右弯道，确认车轮转向符号正确。
+5. 检查 K4 能立刻停车后，才允许落地低速测试。
+6. `1.2.0-dev` 已知会在直角弯越线，不应继续高速落地测试。
+
+工程为 DMP 四元数换算预留 2 KB 栈空间。`.syscfg` 是引脚和外设配置的源文件；不要手工修改 `build/` 中生成的 `ti_msp_dl_config.c/.h` 或 `.out` 文件。

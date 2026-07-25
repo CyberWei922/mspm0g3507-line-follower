@@ -26,7 +26,8 @@ typedef enum {
 typedef enum {
     IMU_DMP_SAMPLE_MISSED = 0,
     IMU_DMP_SAMPLE_OK,
-    IMU_DMP_SAMPLE_YAW_JUMP
+    IMU_DMP_SAMPLE_YAW_JUMP,
+    IMU_DMP_SAMPLE_REANCHORED
 } ImuDmpSampleStatus;
 
 extern volatile ImuMpu6050Status gImuStatus;
@@ -39,6 +40,7 @@ extern volatile float gImuYawDegrees;
 extern volatile float gImuYawUnwrappedDegrees;
 extern volatile float gImuGyroZDps;
 extern volatile float gImuGyroZBiasDps;
+extern volatile float gImuRelativeGyroAngleDegrees;
 extern volatile float gImuGyroZCalibrationSpanDps;
 extern volatile float gImuYawScaleFactor;
 extern volatile float gImuRateKalmanGain;
@@ -47,6 +49,7 @@ extern volatile uint16_t gImuDLPFHz;
 extern volatile uint32_t gImuRawReadErrors;
 extern volatile uint32_t gImuDmpReadMisses;
 extern volatile uint32_t gImuRejectedYawJumps;
+extern volatile uint32_t gImuCornerYawReanchors;
 
 bool IMU_MPU6050_init(void);
 bool IMU_MPU6050_prepare(void);
@@ -55,8 +58,11 @@ ImuCalibrationState IMU_MPU6050_calibrationStep(void);
 bool IMU_MPU6050_finishCalibration(void);
 bool IMU_MPU6050_restartStream(void);
 bool IMU_MPU6050_update(bool stationary);
+void IMU_MPU6050_setCornerMode(bool enabled);
 void IMU_MPU6050_setYawJumpLimit(float maxStepDegrees);
 void IMU_MPU6050_setYawScaleFactor(float scaleFactor);
+void IMU_MPU6050_resetRelativeGyroAngle(void);
+float IMU_MPU6050_signedRelativeGyroAngle(void);
 float IMU_MPU6050_relativeAngle(float startYawUnwrapped);
 float IMU_MPU6050_signedRelativeAngle(float startYawUnwrapped);
 

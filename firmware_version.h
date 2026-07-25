@@ -2,9 +2,9 @@
 #define YAHBOOM_FIRMWARE_VERSION_H
 
 #define FIRMWARE_VERSION_MAJOR  (1U)
-#define FIRMWARE_VERSION_MINOR  (1U)
-#define FIRMWARE_VERSION_PATCH  (1U)
-#define FIRMWARE_VERSION_STRING "1.1.1-dev"
-#define FIRMWARE_VERSION_TAG    "line-follower-v1.1.1-dev"
+#define FIRMWARE_VERSION_MINOR  (2U)
+#define FIRMWARE_VERSION_PATCH  (0U)
+#define FIRMWARE_VERSION_STRING "1.2.0-dev"
+#define FIRMWARE_VERSION_TAG    "line-follower-v1.2.0-dev"
 
 #endif

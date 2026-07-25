@@ -45,18 +45,18 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define MIN_TRACKING_WHEEL_SPEED ((int16_t) 135)
 #define MAX_WHEEL_SPEED     ((int16_t) 320)
 #define MAX_PID_CORRECTION  ((int16_t) 175)
-#define CORNER_APPROACH_SPEED ((int16_t) 210)
-#define CORNER_PIVOT_SPEED    ((int16_t) 330)
-#define CORNER_PIVOT_SLOW_SPEED ((int16_t) 270)
-#define CORNER_SETTLE_SPEED   ((int16_t) 230)
+#define CORNER_APPROACH_SPEED ((int16_t) 260)
+#define CORNER_PIVOT_SPEED    ((int16_t) 400)
+#define CORNER_PIVOT_SLOW_SPEED ((int16_t) 340)
+#define CORNER_SETTLE_SPEED   ((int16_t) 280)
 #define CORNER_SETTLE_MAX_CORRECTION ((int16_t) 130)
 #define CORNER_CENTER_ERROR_LIMIT ((int16_t) 75)
-#define LOST_PIVOT_SPEED      ((int16_t) 210)
+#define LOST_PIVOT_SPEED      ((int16_t) 360)
 
 #define CORNER_SLOW_ANGLE_DEGREES       (72.0f)
 #define CORNER_REACQUIRE_ANGLE_DEGREES  (78.0f)
 #define CORNER_ABORT_ANGLE_DEGREES      (145.0f)
-#define CORNER_IMU_MAX_YAW_STEP_DEGREES (90.0f)
+#define CORNER_IMU_MAX_YAW_STEP_DEGREES (150.0f)
 #define NORMAL_IMU_MAX_YAW_STEP_DEGREES (30.0f)
 
 /*
@@ -79,6 +79,7 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define GYRO_RATE_MAX_CORRECTION        ((int16_t) 70)
 #define IMU_RAW_FAILURE_LIMIT_CYCLES    (5U)
 #define IMU_YAW_STALE_LIMIT_CYCLES      (15U)
+#define IMU_CORNER_YAW_STALE_LIMIT_CYCLES (130U)
 #define IMU_WARMUP_TICKS                (400U)
 
 /*
@@ -90,9 +91,10 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define TRACKING_SPEED_MAX          ((int16_t) 400)
 #define TRACKING_SPEED_STEP         ((int16_t) 20)
 #define OFFICIAL_CAR_APB            (188L)
-#define OFFICIAL_TURN_KP            (150L)
-#define OFFICIAL_TURN_KI            (4L)
-#define OFFICIAL_PATTERN_INTEGRAL_LIMIT (80L)
+#define OFFICIAL_TURN_KP            (190L)
+#define OFFICIAL_TURN_KI            (5L)
+#define OFFICIAL_PATTERN_INTEGRAL_LIMIT (100L)
+#define OFFICIAL_SMALL_ERROR_INTEGRAL_STEP (2L)
 #define OFFICIAL_TURN_KD_NUM        (1L)
 #define OFFICIAL_TURN_KD_DEN        (2L)
 #define OFFICIAL_MAX_WHEEL_SPEED    ((int16_t) 500)
@@ -106,7 +108,7 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define PID_KD_DEN          (100L)
 #define PID_INTEGRAL_LIMIT  (8000L)
 
-#define LOST_LINE_LIMIT_CYCLES (40U)
+#define LOST_LINE_LIMIT_CYCLES (80U)
 #define WIDE_MARK_LIMIT_CYCLES (25U)
 #define STARTUP_SAMPLE_COUNT   (32U)
 #define CORNER_CONFIRM_CYCLES       (2U)
@@ -114,7 +116,7 @@ const char gFirmwareVersion[] __attribute__((used)) = FIRMWARE_VERSION_TAG;
 #define CORNER_REACQUIRE_CYCLES     (4U)
 #define CORNER_SETTLE_CYCLES        (8U)
 #define CORNER_TURN_TIMEOUT_CYCLES  (120U)
-#define LOST_PIVOT_AFTER_CYCLES     (5U)
+#define LOST_PIVOT_AFTER_CYCLES     (3U)
 
 #define DELAY_5_MS         ((CPUCLK_FREQ / 1000U) * 5U)
 #define DELAY_20_MS        ((CPUCLK_FREQ / 1000U) * 20U)
@@ -203,6 +205,9 @@ volatile uint32_t gI2cErrorCount;
 volatile float gCornerStartYaw;
 volatile float gCornerSignedYawDelta;
 volatile float gCornerTurnAngle;
+volatile float gCornerDmpTurnAngle;
+volatile float gCornerGyroTurnAngle;
+volatile bool gIdealCenterPairDetected;
 volatile float gGyroTargetRateDps;
 volatile float gGyroRateErrorDps;
 volatile int16_t gGyroAssistCorrection;
@@ -722,13 +727,22 @@ static CornerDirection detectCornerCandidate(uint8_t blackMask)
     uint8_t leftCount = countSetBits((uint8_t) (blackMask & LEFT_HALF_MASK));
     uint8_t rightCount =
         countSetBits((uint8_t) (blackMask & RIGHT_HALF_MASK));
+    bool leftOuterPair =
+        ((blackMask & LEFT_OUTER_MASK) == LEFT_OUTER_MASK);
+    bool rightOuterPair =
+        ((blackMask & RIGHT_OUTER_MASK) == RIGHT_OUTER_MASK);
 
-    if ((leftCount >= 3U) && (rightCount <= 1U) &&
-        ((blackMask & LEFT_OUTER_MASK) != 0U)) {
+    /*
+     * A slowly moving car can pass the corner vertex while only the two
+     * outer sensors see the transverse line. Accept that strong outer-pair
+     * signature as well as the original three-sensor signature.
+     */
+    if ((rightCount <= 1U) &&
+        ((leftCount >= 3U) || ((leftCount >= 2U) && leftOuterPair))) {
         return CORNER_LEFT;
     }
-    if ((rightCount >= 3U) && (leftCount <= 1U) &&
-        ((blackMask & RIGHT_OUTER_MASK) != 0U)) {
+    if ((leftCount <= 1U) &&
+        ((rightCount >= 3U) || ((rightCount >= 2U) && rightOuterPair))) {
         return CORNER_RIGHT;
     }
     return CORNER_NONE;
@@ -861,7 +875,11 @@ static int8_t officialPatternError(uint8_t x1, uint8_t x2, uint8_t x3,
 static int16_t APP_ELE_PID_Calc(int8_t actualValue)
 {
     int32_t magnitude = actualValue;
+    int32_t integralStep;
     int32_t output;
+    bool idealCenterPair = (gBlackMask == CENTER_SENSOR_MASK);
+
+    gIdealCenterPairDetected = idealCenterPair;
 
     /*
      * The gyro can make yaw rate reach zero while the optical error remains
@@ -869,9 +887,11 @@ static int16_t APP_ELE_PID_Calc(int8_t actualValue)
      * attached to the grayscale error, not to yaw rate: it keeps applying a
      * small lateral correction until the line returns to the center sensors.
      *
-     * A sign reversal halves the stored correction, and a centered pattern
-     * decays it slowly instead of dropping it abruptly. Sharp patterns bypass
-     * the integral so a corner cannot inherit straight-line compensation.
+     * A sign reversal halves the stored correction. Exactly the two middle
+     * sensors on black is the real straight-line target, so the learned
+     * integral trim is held in that state instead of quickly decaying and
+     * letting the same mechanical drift return. Sharp patterns bypass the
+     * integral so a corner cannot inherit straight-line compensation.
      */
     if (magnitude < 0L) {
         magnitude = -magnitude;
@@ -879,14 +899,22 @@ static int16_t APP_ELE_PID_Calc(int8_t actualValue)
     if (magnitude > 3L) {
         sOfficialPatternIntegral = 0L;
     } else if (actualValue == 0) {
-        sOfficialPatternIntegral =
-            (7L * sOfficialPatternIntegral) / 8L;
+        if (!idealCenterPair) {
+            sOfficialPatternIntegral =
+                (7L * sOfficialPatternIntegral) / 8L;
+        }
     } else {
         if (((actualValue > 0) && (sOfficialPatternIntegral < 0L)) ||
             ((actualValue < 0) && (sOfficialPatternIntegral > 0L))) {
             sOfficialPatternIntegral /= 2L;
         }
-        sOfficialPatternIntegral += actualValue;
+        integralStep = actualValue;
+        if ((magnitude == 1L) &&
+            ((gBlackMask & CENTER_SENSOR_MASK) != 0U) &&
+            (gActiveSensorCount <= 2U)) {
+            integralStep *= OFFICIAL_SMALL_ERROR_INTEGRAL_STEP;
+        }
+        sOfficialPatternIntegral += integralStep;
     }
 
     if (sOfficialPatternIntegral > OFFICIAL_PATTERN_INTEGRAL_LIMIT) {
@@ -1010,13 +1038,17 @@ static void LineWalking(void)
 
 static void beginCorner(CornerDirection direction)
 {
+    IMU_MPU6050_setCornerMode(true);
     IMU_MPU6050_setYawJumpLimit(CORNER_IMU_MAX_YAW_STEP_DEGREES);
+    IMU_MPU6050_resetRelativeGyroAngle();
     gCornerDirection = direction;
     gFollowState = FOLLOW_STATE_CORNER_APPROACH;
     gCornerPhaseCycles = 0U;
     gCornerReacquireCycles = 0U;
     gCornerSignedYawDelta = 0.0f;
     gCornerTurnAngle = 0.0f;
+    gCornerDmpTurnAngle = 0.0f;
+    gCornerGyroTurnAngle = 0.0f;
     sCornerOldLineCleared = false;
     sCornerYawCaptured = false;
     sCornerCandidate = CORNER_NONE;
@@ -1044,8 +1076,13 @@ static void cornerControlStep(void)
     if (lineShapeValid) {
         sensedPosition =
             blackMaskToPosition(gBlackMask, gActiveSensorCount);
+        /*
+         * The normal 18 mm tape should cover both middle sensors. Requiring
+         * that pair prevents a single middle sensor from ending the pivot
+         * while the chassis is still visibly angled away from the new line.
+         */
         centerAligned =
-            ((gBlackMask & CENTER_SENSOR_MASK) != 0U) &&
+            ((gBlackMask & CENTER_SENSOR_MASK) == CENTER_SENSOR_MASK) &&
             (sensedPosition >= -CORNER_CENTER_ERROR_LIMIT) &&
             (sensedPosition <= CORNER_CENTER_ERROR_LIMIT);
     }
@@ -1059,8 +1096,11 @@ static void cornerControlStep(void)
                 stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
             }
             gCornerStartYaw = gImuYawUnwrappedDegrees;
+            IMU_MPU6050_resetRelativeGyroAngle();
             gCornerSignedYawDelta = 0.0f;
             gCornerTurnAngle = 0.0f;
+            gCornerDmpTurnAngle = 0.0f;
+            gCornerGyroTurnAngle = 0.0f;
             sCornerYawCaptured = true;
             gFollowState = FOLLOW_STATE_CORNER_PIVOT;
             gCornerPhaseCycles = 0U;
@@ -1084,9 +1124,29 @@ static void cornerControlStep(void)
          * from falsely satisfying the angle threshold.
          */
         if (gCornerDirection == CORNER_LEFT) {
-            gCornerTurnAngle = gCornerSignedYawDelta;
+            gCornerDmpTurnAngle = gCornerSignedYawDelta;
+            gCornerGyroTurnAngle =
+                IMU_MPU6050_signedRelativeGyroAngle();
         } else {
-            gCornerTurnAngle = -gCornerSignedYawDelta;
+            gCornerDmpTurnAngle = -gCornerSignedYawDelta;
+            gCornerGyroTurnAngle =
+                -IMU_MPU6050_signedRelativeGyroAngle();
+        }
+        if (gCornerDmpTurnAngle < 0.0f) {
+            gCornerDmpTurnAngle = 0.0f;
+        }
+        if (gCornerGyroTurnAngle < 0.0f) {
+            gCornerGyroTurnAngle = 0.0f;
+        }
+        /*
+         * DMP remains the preferred long-term stream. Short-term raw gyro
+         * integration fills the missing angle when a delayed DMP packet was
+         * re-anchored instead of accepted as one huge jump.
+         */
+        if (gCornerGyroTurnAngle > gCornerDmpTurnAngle) {
+            gCornerTurnAngle = gCornerGyroTurnAngle;
+        } else {
+            gCornerTurnAngle = gCornerDmpTurnAngle;
         }
         if (gCornerTurnAngle >= CORNER_SLOW_ANGLE_DEGREES) {
             pivotSpeed = CORNER_PIVOT_SLOW_SPEED;
@@ -1172,6 +1232,7 @@ static void cornerControlStep(void)
     gCornerPhaseCycles++;
     if (gCornerPhaseCycles >= CORNER_SETTLE_CYCLES) {
         gFollowState = FOLLOW_STATE_RUNNING;
+        IMU_MPU6050_setCornerMode(false);
         IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
         gCornerDirection = CORNER_NONE;
         gCornerPhaseCycles = 0U;
@@ -1190,6 +1251,14 @@ static void cornerControlStep(void)
 
 static void updateImuOrFault(void)
 {
+    bool cornerActive =
+        (gFollowState == FOLLOW_STATE_CORNER_APPROACH) ||
+        (gFollowState == FOLLOW_STATE_CORNER_PIVOT) ||
+        (gFollowState == FOLLOW_STATE_CORNER_SETTLE);
+    uint16_t yawStaleLimit = cornerActive ?
+        IMU_CORNER_YAW_STALE_LIMIT_CYCLES :
+        IMU_YAW_STALE_LIMIT_CYCLES;
+
     if (IMU_MPU6050_update(false)) {
         gImuRawFailureCycles = 0U;
     } else {
@@ -1204,7 +1273,7 @@ static void updateImuOrFault(void)
         gImuYawStaleCycles = 0U;
     } else {
         gImuYawStaleCycles++;
-        if (gImuYawStaleCycles > IMU_YAW_STALE_LIMIT_CYCLES) {
+        if (gImuYawStaleCycles > yawStaleLimit) {
             /*
              * Seven short beeps: DMP produced no usable sample for too long.
              * Eight short beeps identifies repeated DMP yaw jumps separately.
@@ -1371,6 +1440,7 @@ static bool startTrackingFromCurrentLine(void)
 
     resetTrackingController(
         initialStableRaw, initialBlackMask, initialBlackCount);
+    IMU_MPU6050_setCornerMode(false);
     IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
     if (!IMU_MPU6050_restartStream()) {
         stopAndLatchFault(FOLLOW_STATE_IMU_FAULT, 6U, false);
@@ -1386,6 +1456,7 @@ static bool startTrackingFromCurrentLine(void)
 
 static void enterReadyState(void)
 {
+    IMU_MPU6050_setCornerMode(false);
     IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
     gFollowState = FOLLOW_STATE_READY;
     gLeftCommand = 0;
@@ -1397,6 +1468,7 @@ static void enterReadyState(void)
 
 static void pauseTracking(void)
 {
+    IMU_MPU6050_setCornerMode(false);
     IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
     if (!stopAllMotorsTwice()) {
         stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
@@ -1411,6 +1483,7 @@ static void pauseTracking(void)
 
 static void emergencyStop(void)
 {
+    IMU_MPU6050_setCornerMode(false);
     IMU_MPU6050_setYawJumpLimit(NORMAL_IMU_MAX_YAW_STEP_DEGREES);
     if (!stopAllMotorsTwice()) {
         stopAndLatchFault(FOLLOW_STATE_I2C_FAULT, 3U, true);
