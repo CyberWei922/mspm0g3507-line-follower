@@ -24,6 +24,12 @@ int main(void)
     DL_GPIO_initDigitalInput(GPIO_BUZZER_C3_IOMUX);
 #endif
 
+    /*
+     * OLED没有独立复位脚时，电源刚建立的瞬间可能还不能应答I2C。
+     * 这里只等待外设稳定，不改变任何循迹、状态机或电机控制逻辑。
+     */
+    SystemTime_DelayMs(OLED_POWER_ON_SETTLE_MS);
+
     /* 初始化、自检和所有状态逻辑均封装在APP层。 */
     AppStateMachine_Init();
 

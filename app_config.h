@@ -8,6 +8,11 @@
 
 #define APP_ENABLE_OLED                    (1U)
 
+/* OLED模块上电后先等待电源和控制器稳定，再进行第一次I2C访问。 */
+#define OLED_POWER_ON_SETTLE_MS            (200U)
+#define OLED_INIT_RETRY_COUNT              (4U)
+#define OLED_INIT_RETRY_DELAY_MS           (50U)
+
 /*
  * 临时静音开关：只断开PB24上的PWM物理输出，不改蜂鸣器状态机和提示规则。
  * 室内需要恢复声音时改回1，再重新编译即可。

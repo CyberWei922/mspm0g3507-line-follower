@@ -43,6 +43,25 @@ static uint16_t s_free_line_ms;
 static uint16_t s_corner_cooldown_ms;
 static bool s_curve_gate_enabled;
 
+static bool init_oled_with_retry(void)
+{
+    uint8_t attempt;
+
+#if APP_ENABLE_OLED
+    for (attempt = 0U; attempt < OLED_INIT_RETRY_COUNT; ++attempt) {
+        if (AppDebug_Init()) {
+            return true;
+        }
+        if ((attempt + 1U) < OLED_INIT_RETRY_COUNT) {
+            SystemTime_DelayMs(OLED_INIT_RETRY_DELAY_MS);
+        }
+    }
+#else
+    (void) attempt;
+#endif
+    return false;
+}
+
 static int32_t absolute_i32(int32_t value)
 {
     return (value < 0) ? -value : value;
@@ -144,7 +163,8 @@ static void handle_start_request(void)
     /*
      * 八路灰度使用普通GPIO采样，没有ACK或设备ID，任何0/1组合都可能是
      * 合法现场数据，不能用raw==0判断模块断线。具体图案是否合法由下面
-     * 的start_line_valid/pattern分支负责，异常图案进入FAULT2而非FAULT1。
+     * 的valid_line/pattern分支负责：连续黑线直接进入状态1，全白进入
+     * 状态2，离散或全黑图案进入FAULT2而非FAULT1。
      */
     g_self_test_line_ok = true;
     g_self_test_motor_ok = Motor_Probe();
@@ -153,7 +173,7 @@ static void handle_start_request(void)
         return;
     }
 
-    if (s_line.start_line_valid) {
+    if (s_line.valid_line) {
         enter_tracking(APP_STATE_STRAIGHT_TRACKING);
     } else if (s_line.pattern == LINE_PATTERN_ALL_WHITE) {
         enter_tracking(APP_STATE_FREE_STRAIGHT);
@@ -282,7 +302,12 @@ static void run_line_tracking(LineControlProfile profile)
 
 static void run_free_straight(void)
 {
-    if (s_line.start_line_valid) {
+    /*
+     * 状态2只等待“连续且非全黑”的黑线，不要求必须落在中心探头，
+     * 也不要求是窄直线；进入状态1后由正常加权误差和PD负责拉回线路。
+     * 全白、离散和全黑仍不会触发切换。
+     */
+    if (s_line.valid_line) {
         s_free_line_ms = (uint16_t) (s_free_line_ms +
             APP_CONTROL_PERIOD_MS);
         if (s_free_line_ms >= FREE_RUN_LINE_CONFIRM_MS) {
@@ -392,13 +417,14 @@ static void refresh_debug(void)
 
 void AppStateMachine_Init(void)
 {
+    /* OLED先完成上电自检并显示启动页，随后才进入其余模块自检。 */
+    g_self_test_oled_ok = init_oled_with_retry();
+    AppDebug_ShowBoot("SELF TEST");
+
     Motor_Init();
     EightTracking_Init();
     Key_Init();
     StatusLed_Set(true, false);
-
-    g_self_test_oled_ok = AppDebug_Init();
-    AppDebug_ShowBoot("SELF TEST");
 
     /* 无论自检成功与否，车辆首先保持停车。 */
     g_self_test_motor_ok = Motor_Stop() && Motor_Probe();

@@ -146,11 +146,6 @@ void EightTracking_Read(LineObservation *observation)
         observation->pattern = LINE_PATTERN_DISCRETE_INVALID;
         return;
     }
-    if (observation->active_count > 4U) {
-        observation->pattern = LINE_PATTERN_TOO_WIDE;
-        return;
-    }
-
     for (channel = 0U; channel < 8U; ++channel) {
         if ((observation->black_mask & (uint8_t) (1U << channel)) != 0U) {
 #if LINE_CHANNEL0_IS_LEFT
@@ -164,7 +159,13 @@ void EightTracking_Read(LineObservation *observation)
 
     observation->error =
         (int16_t) (weighted_sum / observation->active_count);
-    observation->pattern = LINE_PATTERN_VALID;
+    /*
+     * 只要黑线连续，就保留加权误差供PD使用。过宽线仍记录为
+     * TOO_WIDE用于诊断，但不再把它判成无效，避免斜着进入或偏离中心
+     * 时无法从自主直行切换到正常循迹。
+     */
+    observation->pattern = (observation->active_count > 4U) ?
+        LINE_PATTERN_TOO_WIDE : LINE_PATTERN_VALID;
     observation->valid_line = true;
     observation->straight_line =
         ((observation->black_mask & CENTER_MASK) != 0U) &&
