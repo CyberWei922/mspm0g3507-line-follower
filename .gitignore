@@ -1,16 +1,16 @@
-# CCS / SysConfig generated build output
-build/
+# CCS / SysConfig生成目录
 Debug/
 Release/
+build/
 
-# CCS imported-project metadata (projectspec remains the source of truth)
+# CCS导入产生的本地元数据；projectspec是工程导入源
 .project
 .cproject
 .ccsproject
 .settings/
 targetConfigs/
 
-# Compiler and linker products
+# 编译与链接产物
 *.obj
 *.o
 *.out

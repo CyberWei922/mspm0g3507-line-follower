@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<projectSpec>
+    <applicability>
+        <when><context deviceFamily="ARM" deviceId="MSPM0G3507" /></when>
+    </applicability>
+    <project
+        title="MSPM0G3507 全新模块化循迹车"
+        name="mspm0g3507_lineTracker"
+        configurations="Debug"
+        toolChain="TICLANG"
+        connection="TIXDS110_Connection.xml"
+        device="MSPM0G3507"
+        ignoreDefaultDeviceSettings="true"
+        ignoreDefaultCCSSettings="true"
+        products="MSPM0-SDK;sysconfig"
+        compilerBuildOptions="
+            -I${PROJECT_ROOT}
+            -I${PROJECT_ROOT}/APP
+            -I${PROJECT_ROOT}/BSP/Common
+            -I${PROJECT_ROOT}/BSP/System
+            -I${PROJECT_ROOT}/BSP/Eight_Tracking
+            -I${PROJECT_ROOT}/BSP/MPU6050
+            -I${PROJECT_ROOT}/BSP/Motor
+            -I${PROJECT_ROOT}/BSP/OLED
+            -I${PROJECT_ROOT}/BSP/Key
+            -I${PROJECT_ROOT}/BSP/Buzzer
+            -I${PROJECT_ROOT}/BSP/LED
+            -I${PROJECT_ROOT}/${ConfigName}
+            -D__MSPM0G3507__
+            -O2 @device.opt
+            -I${COM_TI_MSPM0_SDK_INSTALL_DIR}/source/third_party/CMSIS/Core/Include
+            -I${COM_TI_MSPM0_SDK_INSTALL_DIR}/source
+            -mcpu=cortex-m0plus -march=thumbv6m -mfloat-abi=soft -mthumb -Wall
+        "
+        linkerBuildOptions="
+            -Wl,--stack_size=1024 -Wl,--heap_size=256
+            -ldevice.cmd.genlibs
+            -L${COM_TI_MSPM0_SDK_INSTALL_DIR}/source
+            -L${PROJECT_ROOT}
+            -L${PROJECT_BUILD_DIR}/syscfg
+            -Wl,--rom_model -Wl,--warn_sections
+            -L${CG_TOOL_ROOT}/lib -llibc.a
+        "
+        sysConfigBuildOptions="
+            --output .
+            --product ${COM_TI_MSPM0_SDK_INSTALL_DIR}/.metadata/product.json
+            --compiler ticlang
+        "
+        sourceLookupPath="${COM_TI_MSPM0_SDK_INSTALL_DIR}/source/ti/driverlib"
+        description="六状态模块化巡线：加权PD、动态降速、MPU6050角速度辅助和连续保线直角转弯">
+
+        <property name="buildProfile" value="release"/>
+        <property name="isHybrid" value="true"/>
+
+        <file path="../main.c" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../app_config.h" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../mspm0g3507_lineTracker.syscfg" openOnCreation="true" excludeFromBuild="false" action="copy" />
+        <file path="../README.md" openOnCreation="true" excludeFromBuild="true" action="copy" />
+        <file path="../DESIGN.md" openOnCreation="false" excludeFromBuild="true" action="copy" />
+        <file path="../VERSION" openOnCreation="false" excludeFromBuild="true" action="copy" />
+
+        <file path="../APP/app_state_machine.c" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_state_machine.h" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_line_control.c" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_line_control.h" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_turn_control.c" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_turn_control.h" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_debug.c" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+        <file path="../APP/app_debug.h" excludeFromBuild="false" action="copy" targetDirectory="APP" />
+
+        <file path="../BSP/Common/soft_i2c.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/Common" />
+        <file path="../BSP/Common/soft_i2c.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/Common" />
+        <file path="../BSP/System/system_time.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/System" />
+        <file path="../BSP/System/system_time.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/System" />
+        <file path="../BSP/Eight_Tracking/eight_tracking.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/Eight_Tracking" />
+        <file path="../BSP/Eight_Tracking/eight_tracking.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/Eight_Tracking" />
+        <file path="../BSP/MPU6050/mpu6050.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/MPU6050" />
+        <file path="../BSP/MPU6050/mpu6050.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/MPU6050" />
+        <file path="../BSP/Motor/motor.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/Motor" />
+        <file path="../BSP/Motor/motor.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/Motor" />
+        <file path="../BSP/OLED/oled.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/OLED" />
+        <file path="../BSP/OLED/oled.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/OLED" />
+        <file path="../BSP/Key/key.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/Key" />
+        <file path="../BSP/Key/key.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/Key" />
+        <file path="../BSP/Buzzer/buzzer.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/Buzzer" />
+        <file path="../BSP/Buzzer/buzzer.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/Buzzer" />
+        <file path="../BSP/LED/status_led.c" excludeFromBuild="false" action="copy" targetDirectory="BSP/LED" />
+        <file path="../BSP/LED/status_led.h" excludeFromBuild="false" action="copy" targetDirectory="BSP/LED" />
+    </project>
+</projectSpec>

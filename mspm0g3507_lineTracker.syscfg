@@ -1,0 +1,143 @@
+/**
+ * MSPM0G3507全新模块化巡线工程。
+ */
+//@cliArgs --device "MSPM0G350X" --package "LQFP-64(PM)" --part "Default"
+//@v2CliArgs --device "MSPM0G3507" --package "LQFP-64(PM)"
+//@versions {"tool":"1.28.0"}
+
+const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
+const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
+const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
+const TIMER  = scripting.addModule("/ti/driverlib/TIMER", {}, false);
+const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
+const Board  = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+/* 电机驱动板软件I2C：PA12=SCL，PA13=SDA。 */
+const MOTOR_I2C = GPIO.addInstance();
+MOTOR_I2C.$name = "MOTOR_I2C";
+MOTOR_I2C.port = "PORTA";
+MOTOR_I2C.associatedPins.create(2);
+MOTOR_I2C.associatedPins[0].$name = "MOTOR_SCL";
+MOTOR_I2C.associatedPins[0].direction = "INPUT";
+MOTOR_I2C.associatedPins[0].internalResistor = "PULL_UP";
+MOTOR_I2C.associatedPins[0].assignedPin = "12";
+MOTOR_I2C.associatedPins[1].$name = "MOTOR_SDA";
+MOTOR_I2C.associatedPins[1].direction = "INPUT";
+MOTOR_I2C.associatedPins[1].internalResistor = "PULL_UP";
+MOTOR_I2C.associatedPins[1].assignedPin = "13";
+
+/* 八路灰度：PA14=OUT，PA15/16/17=AD0/AD1/AD2。 */
+const LINE_GPIO = GPIO.addInstance();
+LINE_GPIO.$name = "LINE_GPIO";
+LINE_GPIO.port = "PORTA";
+LINE_GPIO.associatedPins.create(4);
+LINE_GPIO.associatedPins[0].$name = "OUT";
+LINE_GPIO.associatedPins[0].direction = "INPUT";
+LINE_GPIO.associatedPins[0].assignedPin = "14";
+LINE_GPIO.associatedPins[1].$name = "AD0";
+LINE_GPIO.associatedPins[1].direction = "OUTPUT";
+LINE_GPIO.associatedPins[1].initialValue = "CLEARED";
+LINE_GPIO.associatedPins[1].assignedPin = "15";
+LINE_GPIO.associatedPins[2].$name = "AD1";
+LINE_GPIO.associatedPins[2].direction = "OUTPUT";
+LINE_GPIO.associatedPins[2].initialValue = "CLEARED";
+LINE_GPIO.associatedPins[2].assignedPin = "16";
+LINE_GPIO.associatedPins[3].$name = "AD2";
+LINE_GPIO.associatedPins[3].direction = "OUTPUT";
+LINE_GPIO.associatedPins[3].initialValue = "CLEARED";
+LINE_GPIO.associatedPins[3].assignedPin = "17";
+
+/* MPU6050软件I2C：PA1=SCL，PA0=SDA。 */
+const MPU_GPIO = GPIO.addInstance();
+MPU_GPIO.$name = "MPU_GPIO";
+MPU_GPIO.port = "PORTA";
+MPU_GPIO.associatedPins.create(2);
+MPU_GPIO.associatedPins[0].$name = "IMU_SCL";
+MPU_GPIO.associatedPins[0].initialValue = "SET";
+MPU_GPIO.associatedPins[0].ioStructure = "OD";
+MPU_GPIO.associatedPins[0].assignedPin = "1";
+MPU_GPIO.associatedPins[1].$name = "IMU_SDA";
+MPU_GPIO.associatedPins[1].initialValue = "SET";
+MPU_GPIO.associatedPins[1].ioStructure = "OD";
+MPU_GPIO.associatedPins[1].assignedPin = "0";
+
+/* K1/K4位于PORTA，K2/K3位于PORTB，均为低电平按下。 */
+const BUTTONS_A = GPIO.addInstance();
+BUTTONS_A.$name = "BUTTONS_A";
+BUTTONS_A.port = "PORTA";
+BUTTONS_A.associatedPins.create(2);
+BUTTONS_A.associatedPins[0].$name = "K1";
+BUTTONS_A.associatedPins[0].direction = "INPUT";
+BUTTONS_A.associatedPins[0].internalResistor = "PULL_UP";
+BUTTONS_A.associatedPins[0].assignedPin = "2";
+BUTTONS_A.associatedPins[1].$name = "K4";
+BUTTONS_A.associatedPins[1].direction = "INPUT";
+BUTTONS_A.associatedPins[1].internalResistor = "PULL_UP";
+BUTTONS_A.associatedPins[1].assignedPin = "23";
+
+const BUTTONS_B = GPIO.addInstance();
+BUTTONS_B.$name = "BUTTONS_B";
+BUTTONS_B.port = "PORTB";
+BUTTONS_B.associatedPins.create(2);
+BUTTONS_B.associatedPins[0].$name = "K2";
+BUTTONS_B.associatedPins[0].direction = "INPUT";
+BUTTONS_B.associatedPins[0].internalResistor = "PULL_UP";
+BUTTONS_B.associatedPins[0].assignedPin = "19";
+BUTTONS_B.associatedPins[1].$name = "K3";
+BUTTONS_B.associatedPins[1].direction = "INPUT";
+BUTTONS_B.associatedPins[1].internalResistor = "PULL_UP";
+BUTTONS_B.associatedPins[1].assignedPin = "20";
+
+/* 核心板蓝/绿状态灯。 */
+const STATUS_LEDS = GPIO.addInstance();
+STATUS_LEDS.$name = "STATUS_LEDS";
+STATUS_LEDS.port = "PORTB";
+STATUS_LEDS.associatedPins.create(2);
+STATUS_LEDS.associatedPins[0].$name = "BLUE";
+STATUS_LEDS.associatedPins[0].direction = "OUTPUT";
+STATUS_LEDS.associatedPins[0].initialValue = "CLEARED";
+STATUS_LEDS.associatedPins[0].assignedPin = "2";
+STATUS_LEDS.associatedPins[1].$name = "GREEN";
+STATUS_LEDS.associatedPins[1].direction = "OUTPUT";
+STATUS_LEDS.associatedPins[1].initialValue = "CLEARED";
+STATUS_LEDS.associatedPins[1].assignedPin = "3";
+
+/* PB24无源蜂鸣器，沿用已验证的TIMA0 CCP3配置。 */
+const BUZZER = PWM.addInstance();
+BUZZER.$name = "BUZZER";
+BUZZER.ccIndex = [3];
+BUZZER.timerCount = 100;
+BUZZER.timerStartTimer = false;
+BUZZER.clockDivider = 8;
+BUZZER.clockPrescale = 20;
+BUZZER.peripheral.$assign = "TIMA0";
+BUZZER.peripheral.ccp3Pin.$assign = "PB24";
+BUZZER.PWM_CHANNEL_3.$name = "GPIO_BUZZER_C3";
+BUZZER.PWM_CHANNEL_3.dutyCycle = 0;
+
+/* 调试OLED：I2C0，PA31=SCL，PA28=SDA。 */
+const OLED_I2C = I2C.addInstance();
+OLED_I2C.$name = "OLED_I2C";
+OLED_I2C.basicEnableController = true;
+OLED_I2C.basicControllerBusSpeed = 400000;
+OLED_I2C.advAnalogGlitchFilter = "DISABLED";
+OLED_I2C.peripheral.$assign = "I2C0";
+OLED_I2C.peripheral.sclPin.$assign = "PA31";
+OLED_I2C.peripheral.sdaPin.$assign = "PA28";
+
+/* TIMG0产生1 ms系统节拍。 */
+const SYSTEM_TIMER = TIMER.addInstance();
+SYSTEM_TIMER.$name = "SYSTEM_TIMER";
+SYSTEM_TIMER.timerPeriod = "1 ms";
+SYSTEM_TIMER.timerClkDiv = 8;
+SYSTEM_TIMER.timerMode = "PERIODIC";
+SYSTEM_TIMER.interrupts = ["ZERO"];
+SYSTEM_TIMER.interruptPriority = "1";
+SYSTEM_TIMER.peripheral.$assign = "TIMG0";
+
+Board.peripheral.$assign = "DEBUGSS";
+Board.peripheral.swclkPin.$assign = "PA20";
+Board.peripheral.swdioPin.$assign = "PA19";
+
+SYSCTL.forceDefaultClkConfig = true;
+SYSCTL.clockTreeEn = true;
