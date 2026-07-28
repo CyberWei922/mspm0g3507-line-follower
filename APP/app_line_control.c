@@ -2,9 +2,6 @@
 
 #include "app_config.h"
 
-#define LINE_X3_X4_MASK (0x0CU)
-#define LINE_X5_X6_MASK (0x30U)
-
 static int16_t s_previous_error;
 
 static int16_t clamp_i16(int32_t value, int16_t minimum, int16_t maximum)
@@ -50,6 +47,7 @@ void AppLineControl_Update(const LineObservation *line,
     int16_t kd;
     int16_t max_correction;
     int16_t gyro_denominator;
+    int16_t error_magnitude;
 
     if ((line == 0) || (output == 0)) {
         return;
@@ -76,14 +74,18 @@ void AppLineControl_Update(const LineObservation *line,
         gyro_rate_mdps / (1000L * gyro_denominator);
 
     /*
-     * 状态1下，X3+X4或X5+X6表示刚刚偏离中心一格。此处只对这两个
-     * 明确图案追加修正，尽早拉回X4+X5；不提高全局Kp，避免中心附近
-     * 的微小跳变被过度放大并重新造成蛇形。
+     * 状态1下，误差绝对值2对应典型X3+X4/X5+X6，绝对值3还包括
+     * 只压到X3或X6的情况。两者都属于刚离开中心、尚未达到状态3门槛，
+     * 立即追加同向修正；回到中心后D项反向制动，减少越过中心的概率。
      */
-    if (profile == LINE_CONTROL_STRAIGHT) {
-        if (line->black_mask == LINE_X3_X4_MASK) {
+    error_magnitude = (line->error < 0) ?
+        (int16_t) -line->error : line->error;
+    if ((profile == LINE_CONTROL_STRAIGHT) &&
+        (error_magnitude >= 2) &&
+        (error_magnitude < CURVE_ENTER_ERROR_MIN)) {
+        if (line->error < 0) {
             correction -= LINE_STRAIGHT_NEAR_CENTER_BOOST;
-        } else if (line->black_mask == LINE_X5_X6_MASK) {
+        } else {
             correction += LINE_STRAIGHT_NEAR_CENTER_BOOST;
         }
     }

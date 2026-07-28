@@ -29,26 +29,26 @@
 #define LINE_SCAN_MAJORITY_COUNT           (3U)
 #define LINE_CHANNEL_SETTLE_US             (80U)
 
-/* 参考稳定工程的普通循迹速度，单位沿用电机板速度指令。 */
-#define LINE_SPEED_STRAIGHT                (200)
-#define LINE_SPEED_CURVE                   (160)
-#define LINE_SPEED_EDGE                    (135)
-#define LINE_SPEED_OUTER                   (110)
-#define LINE_WHEEL_SPEED_MAX               (360)
+/* 2.2.1分层提速：偏离越大仍主动降速，但保留足够克服地面摩擦的驱动力。 */
+#define LINE_SPEED_STRAIGHT                (220)
+#define LINE_SPEED_CURVE                   (175)
+#define LINE_SPEED_EDGE                    (150)
+#define LINE_SPEED_OUTER                   (125)
+#define LINE_WHEEL_SPEED_MAX               (390)
 
-/* 状态1：直线循迹，采用真正的PD；第一版关闭积分。 */
-#define LINE_STRAIGHT_KP                   (18)
-#define LINE_STRAIGHT_KD                   (8)
-#define LINE_STRAIGHT_MAX_CORRECTION       (160)
+/* 状态1：P负责快速拉回，D在回中时制动，避免一次修正后越过中心。 */
+#define LINE_STRAIGHT_KP                   (20)
+#define LINE_STRAIGHT_KD                   (10)
+#define LINE_STRAIGHT_MAX_CORRECTION       (180)
 #define LINE_STRAIGHT_GYRO_DAMP_DEN        (2)  /* 约0.5*角速度 */
-/* X3+X4或X5+X6亮时追加修正，尽早把黑线拉回X4+X5。 */
-#define LINE_STRAIGHT_NEAR_CENTER_BOOST    (28)
+/* 误差绝对值为2或3时追加修正，尽早把黑线拉回X4+X5。 */
+#define LINE_STRAIGHT_NEAR_CENTER_BOOST    (34)
 
 /* 状态3：弯道更贴线，降低中心速度并减弱陀螺仪阻尼。 */
-#define LINE_CURVE_KP                      (20)
-#define LINE_CURVE_KD                      (6)
-#define LINE_CURVE_CENTER_SPEED            (160)
-#define LINE_CURVE_MAX_CORRECTION          (175)
+#define LINE_CURVE_KP                      (22)
+#define LINE_CURVE_KD                      (7)
+#define LINE_CURVE_CENTER_SPEED            (175)
+#define LINE_CURVE_MAX_CORRECTION          (195)
 #define LINE_CURVE_GYRO_DAMP_DEN           (4)
 
 /* 普通状态的短时丢线记忆和最终停车限制。 */
@@ -63,10 +63,10 @@
 #define CURVE_EXIT_CONFIRM_MS              (240U)
 
 /* 状态2：无黑线起步时按进入状态时的航向自主直行。 */
-#define FREE_RUN_SPEED                     (160)
-#define FREE_RUN_HEADING_KP_NUM            (3)
+#define FREE_RUN_SPEED                     (175)
+#define FREE_RUN_HEADING_KP_NUM            (4)
 #define FREE_RUN_HEADING_KP_DEN            (1000) /* 输入单位为mdeg */
-#define FREE_RUN_MAX_CORRECTION            (80)
+#define FREE_RUN_MAX_CORRECTION            (90)
 #define FREE_RUN_LINE_CONFIRM_MS           (60U)
 #define FREE_RUN_TIMEOUT_MS                (30000U)
 
@@ -77,7 +77,7 @@
  * 直角弯控制移植自“陀螺仪接入稳态循迹转弯/project”：左右轮等幅
  * 反向旋转，离开旧中心线后，新线连续两次进入中心即退出。
  */
-#define CORNER_PIVOT_SPEED                 (125)
+#define CORNER_PIVOT_SPEED                 (130)
 #define CORNER_MIN_TURN_MS                 (100U)
 #define CORNER_LEAVE_MIN_ANGLE_MDEG        (18000L)
 #define CORNER_REACQUIRE_CONFIRM_MS        (40U)
