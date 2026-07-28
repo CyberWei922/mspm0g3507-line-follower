@@ -207,13 +207,26 @@ static void handle_start_request(void)
     }
 }
 
-static bool handle_abnormal_line(void)
+static bool handle_abnormal_line(LineControlProfile profile)
 {
     if (s_line.pattern == LINE_PATTERN_ALL_WHITE) {
         s_invalid_ms = 0U;
         if (s_line_loss_ms < LINE_LONG_LOSS_MS) {
             s_line_loss_ms = (uint16_t) (s_line_loss_ms +
                 APP_CONTROL_PERIOD_MS);
+        }
+
+        /*
+         * 普通直线短暂进入全白，记录当前Yaw并转入自主直行，
+         * 让车辆跨过无黑线间隙。直角检测在本函数之前执行：
+         * 已确认的直角弯会先进入状态4/5，后续全白只由run_corner处理；
+         * 出弯后的冷却窗口内也禁止状态2切换，因此不会从直角弯误切到状态2。
+         */
+        if ((profile == LINE_CONTROL_STRAIGHT) &&
+            (s_corner_cooldown_ms == 0U) &&
+            (s_line_loss_ms >= LINE_SHORT_LOSS_MS)) {
+            enter_tracking(APP_STATE_FREE_STRAIGHT);
+            return false;
         }
         if (s_line_loss_ms >= LINE_LONG_LOSS_MS) {
             enter_stop(APP_FAULT_LINE_LOST);
@@ -264,7 +277,7 @@ static void run_line_tracking(LineControlProfile profile)
     }
 
     if (!s_line.valid_line) {
-        if (!handle_abnormal_line() &&
+        if (!handle_abnormal_line(profile) &&
             (g_app_state != APP_STATE_STOP)) {
             /* 尚未超时，仅保持停车等待下一次有效采样。 */
         }
@@ -325,7 +338,7 @@ static void run_free_straight(void)
     /*
      * 状态2只等待“连续且非全黑”的黑线，不要求必须落在中心探头，
      * 也不要求是窄直线；进入状态1后由正常加权误差和PD负责拉回线路。
-     * 全白、离散和全黑仍不会触发切换。
+     * 状态2内部的全白、离散和全黑不会触发新的状态切换。
      */
     if (s_line.valid_line) {
         s_free_line_ms = (uint16_t) (s_free_line_ms +

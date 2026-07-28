@@ -77,8 +77,25 @@ TurnDirection AppTurnDetector_Update(const LineObservation *line,
     TurnDirection detected = TURN_DIRECTION_NONE;
     uint16_t required_ms = 0U;
 
-    if (cooldown_active || (black == 0U) || (black == 0xFFU)) {
+    if (cooldown_active || (black == 0xFFU)) {
         AppTurnDetector_Reset();
+        return TURN_DIRECTION_NONE;
+    }
+
+    /*
+     * 直角弯的边缘组合可能只出现一个采样周期，下一周期就全白。
+     * 保留已确认的候选方向，允许它完成最长40 ms的边缘确认，
+     * 防止直角弯在全白瞬间被误判成状态2自主直行。
+     */
+    if (black == 0U) {
+        if (s_candidate_direction != TURN_DIRECTION_NONE) {
+            s_candidate_ms = (uint16_t) (s_candidate_ms + elapsed_ms);
+            if (s_candidate_ms >= CORNER_EDGE_CONFIRM_MS) {
+                detected = s_candidate_direction;
+                AppTurnDetector_Reset();
+                return detected;
+            }
+        }
         return TURN_DIRECTION_NONE;
     }
     if (left_primary) {
@@ -172,7 +189,7 @@ TurnResult AppTurnControl_Update(TurnController *controller,
         controller->reacquire_ms = 0U;
     }
 
-    /* 参考工程固定125：左弯(-125,+125)，右弯(+125,-125)。 */
+    /* 按配置固定原地转弯：左弯(-speed,+speed)，右弯(+speed,-speed)。 */
     set_pivot_output(controller->direction, CORNER_PIVOT_SPEED, output);
     return TURN_RESULT_ACTIVE;
 }
