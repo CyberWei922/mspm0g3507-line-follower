@@ -2,6 +2,9 @@
 
 #include "app_config.h"
 
+#define LINE_X3_X4_MASK (0x0CU)
+#define LINE_X5_X6_MASK (0x30U)
+
 static int16_t s_previous_error;
 
 static int16_t clamp_i16(int32_t value, int16_t minimum, int16_t maximum)
@@ -71,6 +74,19 @@ void AppLineControl_Update(const LineObservation *line,
     correction = (int32_t) kp * line->error +
         (int32_t) kd * (line->error - s_previous_error) +
         gyro_rate_mdps / (1000L * gyro_denominator);
+
+    /*
+     * 状态1下，X3+X4或X5+X6表示刚刚偏离中心一格。此处只对这两个
+     * 明确图案追加修正，尽早拉回X4+X5；不提高全局Kp，避免中心附近
+     * 的微小跳变被过度放大并重新造成蛇形。
+     */
+    if (profile == LINE_CONTROL_STRAIGHT) {
+        if (line->black_mask == LINE_X3_X4_MASK) {
+            correction -= LINE_STRAIGHT_NEAR_CENTER_BOOST;
+        } else if (line->black_mask == LINE_X5_X6_MASK) {
+            correction += LINE_STRAIGHT_NEAR_CENTER_BOOST;
+        }
+    }
     correction = clamp_i16(correction,
         (int16_t) -max_correction, max_correction);
 

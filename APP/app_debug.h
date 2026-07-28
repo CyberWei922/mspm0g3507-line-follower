@@ -24,6 +24,7 @@ typedef struct {
 
 bool AppDebug_Init(void);
 void AppDebug_ShowBoot(const char *message);
+void AppDebug_ShowState(uint8_t state, uint8_t fault);
 void AppDebug_Refresh(const AppDebugSnapshot *snapshot);
 bool AppDebug_IsAvailable(void);
 

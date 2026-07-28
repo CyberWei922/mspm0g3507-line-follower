@@ -104,6 +104,28 @@ void AppDebug_ShowBoot(const char *message)
     (void) Oled_Refresh();
 }
 
+void AppDebug_ShowState(uint8_t state, uint8_t fault)
+{
+    char text[22];
+    char *cursor;
+
+    if (!s_available) {
+        return;
+    }
+    Oled_ClearPage(0U);
+    cursor = append_text(text, "STATE:");
+    cursor = append_i32(cursor, state);
+    cursor = append_text(cursor, " FAULT:");
+    cursor = append_i32(cursor, fault);
+    *cursor = '\0';
+    Oled_ShowString(0U, 0U, text);
+
+    /* 运行中只刷新一页，避免完整1024字节刷新阻塞20 ms控制周期。 */
+    if (!Oled_RefreshPages(0U, 1U)) {
+        s_available = false;
+    }
+}
+
 void AppDebug_Refresh(const AppDebugSnapshot *snapshot)
 {
     char state_text[22];

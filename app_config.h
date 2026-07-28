@@ -19,10 +19,9 @@
  */
 #define APP_ENABLE_BUZZER_OUTPUT           (0U)
 
-/* 裸机任务周期。控制器固定20 ms运行，OLED只以100 ms刷新。 */
+/* 裸机任务周期。OLED改为事件触发，不再周期刷新。 */
 #define APP_KEY_PERIOD_MS                  (5U)
 #define APP_CONTROL_PERIOD_MS              (20U)
-#define APP_OLED_PERIOD_MS                 (100U)
 
 /* 八路灰度：沿用之前实车验证版本的物理方向，通道0按车体左侧处理。 */
 #define LINE_CHANNEL0_IS_LEFT              (1U)
@@ -42,6 +41,8 @@
 #define LINE_STRAIGHT_KD                   (8)
 #define LINE_STRAIGHT_MAX_CORRECTION       (160)
 #define LINE_STRAIGHT_GYRO_DAMP_DEN        (2)  /* 约0.5*角速度 */
+/* X3+X4或X5+X6亮时追加修正，尽早把黑线拉回X4+X5。 */
+#define LINE_STRAIGHT_NEAR_CENTER_BOOST    (28)
 
 /* 状态3：弯道更贴线，降低中心速度并减弱陀螺仪阻尼。 */
 #define LINE_CURVE_KP                      (20)
@@ -55,11 +56,10 @@
 #define LINE_LONG_LOSS_MS                  (300U)
 #define LINE_WIDE_INVALID_MS               (120U)
 
-/* 状态1/3切换：k=dYaw/dt，本工程直接使用滤波后的Z轴角速度。 */
-#define CURVE_GATE_LOCK_MS                 (600U)
-#define CURVE_ENTER_RATE_MDPS              (18000L)
+/* 状态1/3切换：X2+X3、X6+X7或更大同向偏离持续500 ms才进入状态3。 */
+#define CURVE_ENTER_ERROR_MIN              (4)
 #define CURVE_EXIT_RATE_MDPS               (6000L)
-#define CURVE_ENTER_CONFIRM_MS             (100U)
+#define CURVE_ENTER_CONFIRM_MS             (500U)
 #define CURVE_EXIT_CONFIRM_MS              (240U)
 
 /* 状态2：无黑线起步时按进入状态时的航向自主直行。 */

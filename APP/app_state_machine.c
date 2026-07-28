@@ -31,17 +31,39 @@ static LineControlOutput s_output;
 static TurnController s_turn;
 static uint32_t s_last_key_ms;
 static uint32_t s_last_control_ms;
-static uint32_t s_last_oled_ms;
 static uint32_t s_state_entry_ms;
 static int32_t s_free_heading_mdeg;
 static uint16_t s_line_loss_ms;
 static uint16_t s_invalid_ms;
 static uint16_t s_curve_enter_ms;
 static uint16_t s_curve_exit_ms;
-static uint16_t s_straight_stable_ms;
 static uint16_t s_free_line_ms;
 static uint16_t s_corner_cooldown_ms;
-static bool s_curve_gate_enabled;
+static int8_t s_curve_candidate_side;
+static bool s_oled_event_pending;
+static bool s_oled_full_refresh_pending;
+
+static void refresh_debug(void);
+
+static void queue_oled_event(bool full_refresh)
+{
+    s_oled_event_pending = true;
+    s_oled_full_refresh_pending = full_refresh;
+}
+
+static void service_oled_event(void)
+{
+    if (!s_oled_event_pending) {
+        return;
+    }
+    s_oled_event_pending = false;
+    if (s_oled_full_refresh_pending) {
+        refresh_debug();
+    } else {
+        AppDebug_ShowState((uint8_t) g_app_state, (uint8_t) g_app_fault);
+    }
+    s_oled_full_refresh_pending = false;
+}
 
 static bool init_oled_with_retry(void)
 {
@@ -73,9 +95,8 @@ static void reset_runtime_counters(void)
     s_invalid_ms = 0U;
     s_curve_enter_ms = 0U;
     s_curve_exit_ms = 0U;
-    s_straight_stable_ms = 0U;
     s_free_line_ms = 0U;
-    s_curve_gate_enabled = false;
+    s_curve_candidate_side = 0;
     AppTurnDetector_Reset();
 }
 
@@ -111,6 +132,8 @@ static void enter_stop(AppFault fault)
     if (fault != APP_FAULT_NONE) {
         Buzzer_PlayLong(1U);
     }
+    /* 车辆已停车，此时允许完整刷新故障和诊断数据。 */
+    queue_oled_event(true);
 }
 
 static void enter_tracking(AppState state)
@@ -128,6 +151,7 @@ static void enter_tracking(AppState state)
         Buzzer_PlayShort(2U);
         s_free_heading_mdeg = Mpu6050_GetYawMdeg();
     }
+    queue_oled_event(false);
 }
 
 static void enter_corner(TurnDirection direction)
@@ -139,6 +163,7 @@ static void enter_corner(TurnDirection direction)
     g_app_fault = APP_FAULT_NONE;
     StatusLed_Set(true, true);
     Buzzer_PlayShort((direction == TURN_DIRECTION_LEFT) ? 4U : 5U);
+    queue_oled_event(false);
 }
 
 static void update_diagnostics(void)
@@ -256,33 +281,28 @@ static void run_line_tracking(LineControlProfile profile)
     }
 
     if (profile == LINE_CONTROL_STRAIGHT) {
-        if (s_line.straight_line) {
-            if (s_straight_stable_ms < CURVE_GATE_LOCK_MS) {
-                s_straight_stable_ms = (uint16_t) (s_straight_stable_ms +
+        if (absolute_i32(s_line.error) >= CURVE_ENTER_ERROR_MIN) {
+            const int8_t error_side = (s_line.error > 0) ? 1 : -1;
+
+            /* 必须在同一侧持续偏离；回中或换边都会重新开始500 ms确认。 */
+            if (error_side != s_curve_candidate_side) {
+                s_curve_candidate_side = error_side;
+                s_curve_enter_ms = APP_CONTROL_PERIOD_MS;
+            } else {
+                s_curve_enter_ms = (uint16_t) (s_curve_enter_ms +
                     APP_CONTROL_PERIOD_MS);
             }
-        } else {
-            s_straight_stable_ms = 0U;
-        }
-
-        if (!s_curve_gate_enabled &&
-            (SystemTime_ElapsedMs(s_state_entry_ms) >= CURVE_GATE_LOCK_MS) &&
-            (s_straight_stable_ms >= CURVE_GATE_LOCK_MS / 2U)) {
-            s_curve_gate_enabled = true;
-        }
-        if (s_curve_gate_enabled &&
-            (absolute_i32(Mpu6050_GetYawRateMdps()) >=
-                CURVE_ENTER_RATE_MDPS)) {
-            s_curve_enter_ms = (uint16_t) (s_curve_enter_ms +
-                APP_CONTROL_PERIOD_MS);
             if (s_curve_enter_ms >= CURVE_ENTER_CONFIRM_MS) {
                 g_app_state = APP_STATE_CURVE_TRACKING;
                 s_state_entry_ms = SystemTime_NowMs();
                 s_curve_exit_ms = 0U;
+                s_curve_candidate_side = 0;
                 AppLineControl_Reset(s_line.error);
+                queue_oled_event(false);
             }
         } else {
             s_curve_enter_ms = 0U;
+            s_curve_candidate_side = 0;
         }
     } else {
         /* S弯换向会短暂过零，必须低角速度并且直线灰度持续成立。 */
@@ -442,8 +462,9 @@ void AppStateMachine_Init(void)
     update_diagnostics();
     s_last_key_ms = SystemTime_NowMs();
     s_last_control_ms = s_last_key_ms;
-    s_last_oled_ms = s_last_key_ms;
     s_corner_cooldown_ms = 0U;
+    s_oled_event_pending = false;
+    s_oled_full_refresh_pending = false;
 
     if (critical_modules_ready()) {
         enter_stop(APP_FAULT_NONE);
@@ -479,8 +500,6 @@ void AppStateMachine_Run(void)
         control_step();
     }
 
-    if ((uint32_t) (now - s_last_oled_ms) >= APP_OLED_PERIOD_MS) {
-        s_last_oled_ms += APP_OLED_PERIOD_MS;
-        refresh_debug();
-    }
+    /* 只处理状态变化或故障事件，不再每100 ms刷新整屏。 */
+    service_oled_event();
 }

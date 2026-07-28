@@ -188,6 +188,21 @@ void Oled_Clear(void)
     }
 }
 
+void Oled_ClearPage(uint8_t page)
+{
+    uint16_t index;
+    uint16_t end;
+
+    if (page >= OLED_PAGE_COUNT) {
+        return;
+    }
+    index = (uint16_t) page * OLED_WIDTH;
+    end = (uint16_t) (index + OLED_WIDTH);
+    while (index < end) {
+        s_buffer[index++] = 0U;
+    }
+}
+
 void Oled_ShowString(uint8_t x, uint8_t page, const char *text)
 {
     if (text == 0) {
@@ -199,21 +214,31 @@ void Oled_ShowString(uint8_t x, uint8_t page, const char *text)
     }
 }
 
-bool Oled_Refresh(void)
+bool Oled_RefreshPages(uint8_t first_page, uint8_t page_count)
 {
-    static const uint8_t window[] = {
-        0x21,0x00,0x7F,0x22,0x00,0x07
+    uint8_t window[] = {
+        0x21,0x00,0x7F,0x22,0x00,0x00
     };
     uint8_t packet[OLED_PACKET_MAX];
-    uint16_t index = 0U;
+    uint16_t index;
+    uint16_t end;
     uint16_t remaining;
-    
+
+    if ((page_count == 0U) || (first_page >= OLED_PAGE_COUNT) ||
+        ((uint16_t) first_page + page_count > OLED_PAGE_COUNT)) {
+        return false;
+    }
+    window[4] = first_page;
+    window[5] = (uint8_t) (first_page + page_count - 1U);
+    index = (uint16_t) first_page * OLED_WIDTH;
+    end = (uint16_t) (first_page + page_count) * OLED_WIDTH;
+
     if ((s_address == 0U) || !write_commands(window, sizeof(window))) {
         return false;
     }
-    while (index < OLED_BUFFER_SIZE) {
-        /* 1024字节显存不能先转换成uint8_t，否则1024会溢出成0，刷新会死循环。 */
-        remaining = (uint16_t) (OLED_BUFFER_SIZE - index);
+    while (index < end) {
+        /* 长度保持uint16_t，避免完整1024字节刷新时发生uint8_t溢出。 */
+        remaining = (uint16_t) (end - index);
         uint8_t copied = (remaining > 7U) ? 7U : (uint8_t) remaining;
         uint8_t i;
 
@@ -227,6 +252,11 @@ bool Oled_Refresh(void)
         index = (uint16_t) (index + copied);
     }
     return true;
+}
+
+bool Oled_Refresh(void)
+{
+    return Oled_RefreshPages(0U, OLED_PAGE_COUNT);
 }
 
 uint8_t Oled_GetAddress(void)
